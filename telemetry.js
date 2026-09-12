@@ -25,8 +25,10 @@ const TELEMETRY_KEYS = ["session-telemetry-otel", "session-telemetry"];
  *
  * - a non-empty `DSH_TELEMETRY_DISABLED` (any value, including `0` and `false`)
  *   opts the process out, and the launchers patch the row off entirely;
- * - `DSH_TELEMETRY_MODE` defaults to `DISABLED`, and anything else (`FULL`,
- *   `FEEDBACK_ONLY`) opts in;
+ * - `DSH_TELEMETRY_MODE` selects the mode; `DISABLED` opts out and anything
+ *   else (`FULL`, `FEEDBACK_ONLY`) opts in. dsh 0.1.5's row defaults to
+ *   `FEEDBACK_ONLY` when the variable is unset, which this scan cannot see —
+ *   the mounted backend is the exact source, and this scan is its fallback;
  * - `DSH_TELEMETRY_OTLP_URL` overrides the production endpoint.
  *
  * @returns `null` when nothing is exported, otherwise the active mode and endpoint.
@@ -103,5 +105,5 @@ export function telemetryModeIn(text) {
 /** Operator-facing explanation, shared by the thrown error and the toast. */
 export function telemetryRefusal({ mode, endpoint, source }) {
   const origin = source === "DSH_TELEMETRY_MODE" ? "DSH_TELEMETRY_MODE" : source;
-  return `DSH session telemetry is enabled (mode ${mode}, from ${origin}), which uploads unredacted session records — including Claude's output — to ${endpoint}. Claude is not available while that is on. Turn it off there, or set DSH_TELEMETRY_DISABLED=1 to opt the process out entirely, then restart DSH.`;
+  return `DSH session telemetry is enabled (mode ${mode}, from ${origin}), which uploads unredacted session records — including Claude's output — to ${endpoint}. Claude is not available while that is on. Turn it off there, or set DSH_TELEMETRY_MODE=DISABLED (or DSH_TELEMETRY_DISABLED=1 to opt the process out entirely) in the shell that launches DSH, then restart it.`;
 }

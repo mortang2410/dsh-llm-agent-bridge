@@ -143,3 +143,67 @@ test("the DSH half activates against a cordis-shaped context and serves the chan
 
   await host.dispose();
 });
+
+test("activation completes while DSH's exporter is live, without shutting it down or disposing its fiber", async () => {
+  const { createDshClaudePlugin } = await import("../dsh-plugin.js");
+
+  // dsh 0.1.5 mounts session-telemetry-otel in FEEDBACK_ONLY by default. The
+  // guard used to act on it from inside activate(), and disposing that row's
+  // fiber while the cordis loader was still applying entries deadlocked the
+  // boot: the loader waited on itself, the web app never printed its URL.
+  const record = { shutdown: 0, disposed: 0 };
+  const sessionTelemetry = {
+    sharing: "feedback-only",
+    provider: {},
+    async shutdown() { record.shutdown += 1; },
+    ctx: { fiber: { async dispose() { record.disposed += 1; } } },
+  };
+  const warnings = [];
+  const ctx = {
+    logger: { warn: message => warnings.push(message), error() {}, info() {} },
+    llm: { registerAdapter: () => () => {} },
+    agents: { list: () => [], get: () => null },
+    on: () => () => {},
+    get: name => (name === "sessionTelemetry" ? sessionTelemetry : undefined),
+    inject: () => ({ dispose() {} }),
+  };
+
+  const host = new PluginHost();
+  const activation = host.activate([
+    createClaudeExecutionPlugin({ client: new FakeClaudeClient(), cwd: "/workspace" }),
+    createDshClaudePlugin(ctx, {}),
+  ]);
+  const outcome = await Promise.race([
+    activation.then(() => "activated"),
+    new Promise(resolve => setTimeout(() => resolve("hung"), 2000)),
+  ]);
+  assert.equal(outcome, "activated", "activation must not block on the telemetry guard");
+
+  assert.equal(record.disposed, 0, "another plugin's fiber is never disposed during activation");
+  assert.equal(record.shutdown, 0, "activation only reads the exporter; enforcement belongs to the turn");
+  assert.match(warnings.find(line => /telemetry is feedback-only/.test(line)) ?? "", /first Claude turn will shut its exporter down/);
+
+  await host.dispose();
+});
+
+test("with telemetry: ignore, activation does not even read the exporter", async () => {
+  const { createDshClaudePlugin } = await import("../dsh-plugin.js");
+
+  const reads = [];
+  const ctx = {
+    logger: { warn() { throw new Error("nothing to warn about in ignore mode"); }, error() {}, info() {} },
+    llm: { registerAdapter: () => () => {} },
+    agents: { list: () => [], get: () => null },
+    on: () => () => {},
+    get: name => { reads.push(name); return undefined; },
+    inject: () => ({ dispose() {} }),
+  };
+
+  const host = new PluginHost();
+  await host.activate([
+    createClaudeExecutionPlugin({ client: new FakeClaudeClient(), cwd: "/workspace" }),
+    createDshClaudePlugin(ctx, { telemetry: "ignore" }),
+  ]);
+  assert.equal(reads.includes("sessionTelemetry"), false);
+  await host.dispose();
+});

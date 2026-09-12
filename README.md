@@ -119,31 +119,54 @@ earlier turns after Claude has seen them, the Claude session keeps the original.
 ## DSH's session telemetry
 
 `@deepseek-ai/dsh-base` mounts an OTLP exporter aimed at
-`harness-telemetry.deepseeksvc.com`. It is off by default, but when it is on,
-DSH's own note on the row says uploads carry session-log records "with no
+`harness-telemetry.deepseeksvc.com`. Since dsh 0.1.5 it is **on by default**, in
+`FEEDBACK_ONLY` mode (earlier releases defaulted to `DISABLED`). DSH's own note
+on the row says uploads carry session-log records "with no
 session-telemetry/record redaction rule, so exports are the raw captured copy" —
 and with this plugin installed, that copy contains Claude's output.
 
-**The plugin turns a live exporter off at load — before any Claude turn is
-possible** — and says so in the log:
-it drains the pipeline through the backend's own `shutdown()`, then unmounts the
-row so capture stops as well. Reading the mounted backend is exact — it sees the
+**Recommended: run DSH with the exporter off at the source.** Set
+`DSH_TELEMETRY_MODE=DISABLED` in the shell that launches DSH (or
+`DSH_TELEMETRY_DISABLED=1`, which patches the row off entirely). The backend is
+then constructed with no pipeline, nothing is ever captured, and the guard below
+has nothing to do.
+
+**The guard runs per turn, not at load.** At the start of every Claude turn the
+adapter reads the mounted `sessionTelemetry` backend — exact, because it sees the
 exporter whatever switched it on, which a scan of environment and config layers
-cannot promise.
+cannot promise — and, if it is exporting, acts according to the `telemetry`
+mode:
 
-Afterwards it re-reads the host rather than trusting its own teardown, and if an
-exporter survived, the turn fails instead. `disable` degrades to `refuse` rather
-than reporting a success it cannot verify. The test suite mounts the real
-`dsh-session-telemetry-otel` backend in `FULL` against a loopback collector and
-asserts both that the row is gone from the host and that nothing reached the
-collector.
+- `disable` (default) drains and quiesces the pipeline through the backend's
+  own `shutdown()`. Once that resolves the OTel provider drops every later
+  record, and the row is remembered as quiesced for the rest of the process, so
+  later turns neither refuse nor shut it down again. A `shutdown()` that rejects
+  (the backend's own deadline) fails the turn instead: `disable` degrades to
+  `refuse` rather than reporting a success it cannot verify. A fresh backend
+  instance — a reload, another plugin re-mounting the row — is caught and
+  handled in its turn.
+- `refuse` fails the turn with an inline error naming what to switch off, and
+  never touches host configuration.
+- `ignore` skips the guard entirely.
 
-What this does not cover: an exporter some other plugin adds. It runs before the
-adapter is registered, so nothing Claude produced can have been captured or
-queued beforehand — but it reaches the row DSH ships, not an arbitrary one.
-Setting `DSH_TELEMETRY_DISABLED=1` in the launching shell prevents the exporter
-from ever being constructed, which is strictly better if you control the
-environment.
+The guard never unmounts the row or disposes another plugin's fiber. Earlier
+releases did both, from inside plugin activation — and with dsh 0.1.5's
+exporter on by default that deadlocked the boot: the cordis loader waited on a
+fiber this plugin had just disposed, `dsh web` never printed its URL, and the UI
+was unreachable. Activation now only reads the posture and logs one line saying
+what the first turn will do; it completes promptly whether or not telemetry is
+exporting.
+
+The test suite mounts the real `dsh-session-telemetry-otel` backend in
+`FEEDBACK_ONLY` against a loopback collector, shows a record reaching it, runs
+the guard, and asserts that the row stays mounted, that nothing reaches the
+collector afterwards, and that later turns do not shut it down again. A
+separate test activates the plugin against a fake exporting backend and asserts
+activation completes without calling `shutdown()` or `fiber.dispose()`.
+
+What this does not cover: an exporter some other plugin adds. The guard reaches
+the row DSH ships, not an arbitrary one — another reason to prefer
+`DSH_TELEMETRY_MODE=DISABLED`.
 
 Configure the behaviour on the plugin row if the default does not suit:
 
@@ -153,9 +176,6 @@ Configure the behaviour on the plugin row if the default does not suit:
   config:
     telemetry: disable   # default; `refuse` fails the turn instead, `ignore` skips the guard
 ```
-
-`refuse` is the choice for anyone who would rather the plugin never touch host
-configuration: turns fail with an inline error naming what to switch off.
 
 ## Tracing a stalled turn
 
@@ -220,17 +240,17 @@ Two things that remain your responsibility:
   entirely. Don't tunnel DSH.
 - **Use an API key for unattended workloads.** Subscription limits assume
   "ordinary, individual usage"; batch or scheduled runs belong on a key.
-- **Telemetry is turned off for you.** See below — you do not have to configure
-  anything, though `DSH_TELEMETRY_DISABLED=1` in the launching shell is still
-  the version with no gap at all. `@deepseek-ai/dsh-base` mounts an OTLP exporter
-  pointed at `harness-telemetry.deepseeksvc.com`. It defaults to `DISABLED` and
-  stays off unless you set `DSH_TELEMETRY_MODE`, but DSH's own note says
-  uploading mirrors session-log records "with no session-telemetry/record
-  redaction rule, so exports are the raw captured copy." With this plugin
-  installed, that raw copy contains Claude's outputs — and Anthropic's Consumer
-  Terms prohibit using the Services to develop or train competing models. Don't
-  set `DSH_TELEMETRY_MODE`; to opt out irrevocably, set `DSH_TELEMETRY_DISABLED`
-  to any non-empty value, which patches the row off entirely.
+- **Turn DSH's telemetry off.** Set `DSH_TELEMETRY_MODE=DISABLED` in the shell
+  that launches DSH. `@deepseek-ai/dsh-base` mounts an OTLP exporter pointed at
+  `harness-telemetry.deepseeksvc.com`, on by default in `FEEDBACK_ONLY` since
+  dsh 0.1.5, and DSH's own note says uploading mirrors session-log records "with
+  no session-telemetry/record redaction rule, so exports are the raw captured
+  copy." With this plugin installed, that raw copy contains Claude's outputs —
+  and Anthropic's Consumer Terms prohibit using the Services to develop or train
+  competing models. The plugin's per-turn guard (below) shuts a live exporter
+  down before Claude runs, but the version with no gap at all is never
+  constructing it: `DSH_TELEMETRY_MODE=DISABLED`, or `DSH_TELEMETRY_DISABLED`
+  set to any non-empty value, which patches the row off entirely.
 
   Check your own posture:
 

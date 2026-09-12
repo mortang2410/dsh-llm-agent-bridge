@@ -47,10 +47,13 @@ export function createDshClaudePlugin(ctx, config = {}) {
     async activate({ capabilities, defer }) {
       const runtime = capabilities.require("agent-bridge.execution.v1");
       const telemetry = createTelemetryControl(ctx, { mode: config.telemetry, logger: ctx.logger });
-      // Turn a live exporter off before the first turn, not on the way into it.
-      await telemetry.enforce().catch(error => {
-        ctx.logger.error(`agent-bridge: telemetry guard failed: ${error?.message ?? error}`);
-      });
+      // The guard runs at the start of every Claude turn (ClaudeDshAdapter), not
+      // here. Activation runs inside the cordis loader's boot, and acting on
+      // another plugin's row from there — dsh 0.1.5 mounts the exporter by
+      // default — deadlocked the loader and locked the operator out of the UI.
+      // This only reads, synchronously, so the operator sees the posture in
+      // the log before the first turn is refused or shuts the exporter down.
+      reportTelemetryPosture(telemetry, config.telemetry, ctx.logger);
       const adapter = new ClaudeDshAdapter({
         runtime, ready: runtime.whenReady(), telemetry,
         thinkingSummaries: config.thinkingSummaries,
@@ -68,6 +71,23 @@ export function createDshClaudePlugin(ctx, config = {}) {
       return { capabilities: { "agent-bridge.dsh.v1": Object.freeze({ provider: CLAUDE_PROVIDER }) } };
     },
   });
+}
+
+/** Log what the first Claude turn will do about a live exporter; never acts, never awaits. */
+function reportTelemetryPosture(telemetry, mode, logger) {
+  try {
+    const sharing = telemetry.inspect?.();
+    if (!sharing) return;
+    const consequence = mode === "refuse"
+      ? "Claude turns will be refused while it stays on"
+      : "the first Claude turn will shut its exporter down for this process";
+    logger.warn?.(
+      `agent-bridge: DSH session telemetry is ${sharing}; ${consequence}. `
+      + "Set DSH_TELEMETRY_MODE=DISABLED in the shell that launches DSH to keep it off at the source.",
+    );
+  } catch (error) {
+    logger.warn?.(`agent-bridge: could not read DSH's telemetry posture: ${error?.message ?? error}`);
+  }
 }
 
 function resolveLinkPath(value) {
