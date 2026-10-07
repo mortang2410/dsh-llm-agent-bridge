@@ -78,10 +78,21 @@ function createClaudeClient(config) {
  * survives, with one addition when a gateway endpoint was configured. The base
  * URL is the only thing this sets: authentication stays whatever Claude Code
  * already owns, so the subscription credential is neither read nor replaced.
+ *
+ * Nonessential traffic is off on this path. Claude Code otherwise generates a
+ * session title of its own on the first turn, and that request carries its own
+ * effort (observed `medium`) rather than the effort the caller selected. With a
+ * gateway in front of the model, that is a second inference request the operator
+ * did not ask for, on a different effort. Turning it off leaves exactly the
+ * turns the harness requested.
  */
 function claudeEnv(config) {
   if (!config.bifrostBaseUrl) return undefined;
-  return { ...process.env, ANTHROPIC_BASE_URL: config.bifrostBaseUrl };
+  return {
+    ...process.env,
+    ANTHROPIC_BASE_URL: config.bifrostBaseUrl,
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
+  };
 }
 
 function createClaudeCliClient(config, env = undefined) {

@@ -224,6 +224,7 @@ writeFileSync(process.argv[2], JSON.stringify({
   baseUrl: process.env.ANTHROPIC_BASE_URL ?? null,
   apiKey: process.env.ANTHROPIC_API_KEY ?? null,
   authToken: process.env.ANTHROPIC_AUTH_TOKEN ?? null,
+  nonessential: process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC ?? null,
   hasPath: typeof process.env.PATH === "string" && process.env.PATH.length > 0,
 }));
 console.log(JSON.stringify({ type: "result", result: "ok" }));
@@ -255,6 +256,47 @@ console.log(JSON.stringify({ type: "result", result: "ok" }));
   assert.equal(seen.hasPath, true, "ordinary environment variables survive");
   assert.equal(seen.apiKey, null, "no API key is invented");
   assert.equal(seen.authToken, null, "no auth token is invented");
+  assert.equal(
+    seen.nonessential, "1",
+    "Claude Code's own title request carries its own effort, so a routed run must not emit it",
+  );
+  await host.dispose();
+});
+
+test("no gateway endpoint means no environment override at all", async (context) => {
+  const { createClaudeExecutionPlugin } = await import("../plugin.mjs");
+  const { mkdtemp, readFile, rm, writeFile } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+
+  const directory = await mkdtemp(join(tmpdir(), "agent-bridge-noenv-"));
+  context.after(() => rm(directory, { recursive: true, force: true }));
+  const envPath = join(directory, "env.json");
+  const scriptPath = join(directory, "fake-claude.mjs");
+  await writeFile(scriptPath, `
+import { writeFileSync } from "node:fs";
+writeFileSync(process.argv[2], JSON.stringify({
+  baseUrl: process.env.ANTHROPIC_BASE_URL ?? null,
+  nonessential: process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC ?? null,
+}));
+console.log(JSON.stringify({ type: "result", result: "ok" }));
+`);
+
+  const host = new PluginHost();
+  await host.activate([createClaudeExecutionPlugin({
+    backend: "cli", command: process.execPath, args: [scriptPath, envPath], cwd: directory,
+  })]);
+  const capability = host.capabilities.require("agent-bridge.execution.v1", "^1.0.0");
+  await capability.whenReady();
+  const session = await capability.createSession({ sessionId: "s-no-gateway", cwd: directory });
+  const completed = new Promise(resolve => {
+    capability.subscribeActivity(message => { if (message.method === "turn/completed") resolve(message); });
+  });
+  await capability.sendMessage(session.id, { text: "hi" });
+  await completed;
+
+  const seen = JSON.parse(await readFile(envPath, "utf8"));
+  assert.equal(seen.baseUrl, null, "an unconfigured bridge must not redirect Claude anywhere");
   await host.dispose();
 });
 
