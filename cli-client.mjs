@@ -17,10 +17,11 @@ function effortArgs(message, session) {
 }
 
 export class ClaudeCliClient extends EventEmitter {
-  constructor({ command = "claude", args = [], requestTimeoutMs = 30 * 60_000 } = {}) {
+  constructor({ command = "claude", args = [], env = process.env, requestTimeoutMs = 30 * 60_000 } = {}) {
     super();
     this.command = command;
     this.args = args;
+    this.env = env;
     this.requestTimeoutMs = requestTimeoutMs;
     this.sessions = new Map();
     this.processes = new Map();
@@ -118,10 +119,12 @@ export class ClaudeCliClient extends EventEmitter {
     const child = spawn(this.command, cliArgs, {
       cwd: message.cwd ?? session.cwd ?? process.cwd(),
       stdio: ["ignore", "pipe", "pipe"],
-      // The child inherits this process's environment and nothing else. A
-      // per-turn env override would be a path for injecting ANTHROPIC_BASE_URL
-      // or an API key into the binary that holds the subscription login.
-      env: process.env,
+      // The same environment the SDK backend hands its child. It defaults to
+      // this process's own environment; a caller that configured a gateway
+      // endpoint passes the environment carrying that endpoint here too, so the
+      // fallback cannot quietly reach Anthropic directly while the SDK path
+      // routes through the gateway.
+      env: this.env,
     });
     child.relayClaudeSessionId = session.id;
     session.created = true;

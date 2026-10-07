@@ -92,6 +92,33 @@ function onceTurnCompleted(client) {
   });
 }
 
+test("the CLI fallback spawns with the configured gateway environment, not process.env", async (context) => {
+  const directory = await mkdtemp(join(tmpdir(), "claude-sdk-cli-env-"));
+  context.after(() => rm(directory, { recursive: true, force: true }));
+  const envPath = join(directory, "env.json");
+  const scriptPath = join(directory, "fake-claude-env.mjs");
+  await writeFile(scriptPath, `
+import { writeFileSync } from "node:fs";
+writeFileSync(process.argv[2], JSON.stringify({
+  baseUrl: process.env.ANTHROPIC_BASE_URL ?? null,
+  hasPath: typeof process.env.PATH === "string" && process.env.PATH.length > 0,
+}));
+console.log(JSON.stringify({ type: "result", result: "ok" }));
+`);
+
+  const env = { ...process.env, ANTHROPIC_BASE_URL: "http://127.0.0.1:8090/anthropic" };
+  const client = new ClaudeCliClient({ command: process.execPath, args: [scriptPath, envPath], env });
+  await client.start();
+  const session = await client.createSession({ sessionId: "33333333-3333-4333-8333-333333333333", cwd: directory });
+  const completed = onceTurnCompleted(client);
+  await client.sendMessage(session.id, { text: "hello" });
+  await completed;
+
+  const seen = JSON.parse(await readFile(envPath, "utf8"));
+  assert.equal(seen.baseUrl, "http://127.0.0.1:8090/anthropic");
+  assert.equal(seen.hasPath, true, "PATH survives so the child is still a working process");
+});
+
 function assertFlag(args, flag, value) {
   const index = args.indexOf(flag);
   assert.notEqual(index, -1, `${flag} is present`);

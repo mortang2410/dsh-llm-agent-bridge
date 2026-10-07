@@ -107,10 +107,14 @@ function disambiguate(models, rows) {
 }
 
 export class ClaudeSdkClient extends EventEmitter {
-  constructor({ sdk = null, pathToClaudeCodeExecutable = undefined, requestTimeoutMs = 30 * 60_000, clock = Date.now } = {}) {
+  constructor({ sdk = null, pathToClaudeCodeExecutable = undefined, env = undefined, requestTimeoutMs = 30 * 60_000, clock = Date.now } = {}) {
     super();
     this.sdk = sdk;
     this.pathToClaudeCodeExecutable = pathToClaudeCodeExecutable;
+    // The environment every spawned Claude Code child runs under. Unset keeps
+    // the SDK's own default (`{...process.env}`); set means the caller built it
+    // from the process environment and pointed ANTHROPIC_BASE_URL at a gateway.
+    this.env = env;
     this.requestTimeoutMs = requestTimeoutMs;
     this.clock = clock;
     this.sessions = new Map();
@@ -245,6 +249,7 @@ export class ClaudeSdkClient extends EventEmitter {
       prompt,
       options: {
         ...(this.pathToClaudeCodeExecutable ? { pathToClaudeCodeExecutable: this.pathToClaudeCodeExecutable } : {}),
+        ...(this.env ? { env: this.env } : {}),
       },
     });
     try {
@@ -279,6 +284,7 @@ export class ClaudeSdkClient extends EventEmitter {
       prompt,
       options: {
         ...(this.pathToClaudeCodeExecutable ? { pathToClaudeCodeExecutable: this.pathToClaudeCodeExecutable } : {}),
+        ...(this.env ? { env: this.env } : {}),
       },
     });
     try {
@@ -400,6 +406,7 @@ export class ClaudeSdkClient extends EventEmitter {
         orchestrationPolicy(message.dshTools, isUltracode(message, session)),
       ),
       pathToClaudeCodeExecutable: this.pathToClaudeCodeExecutable,
+      ...(this.env ? { env: this.env } : {}),
       includePartialMessages: true,
       ...(session.created ? { resume: session.id } : { sessionId: session.id }),
       // Only ask for the permission callback when something could actually

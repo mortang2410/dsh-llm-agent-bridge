@@ -60,19 +60,35 @@ function executionCapability(runtime, ready) {
 
 function createClaudeClient(config) {
   const backend = config.backend ?? "auto";
-  if (backend === "cli") return createClaudeCliClient(config);
+  const env = claudeEnv(config);
+  if (backend === "cli") return createClaudeCliClient(config, env);
   const sdkClient = new ClaudeSdkClient({
     pathToClaudeCodeExecutable: config.codeExecutablePath,
+    env,
     requestTimeoutMs: positiveInteger(config.requestTimeoutMs, 30 * 60_000),
   });
   if (backend === "sdk") return sdkClient;
-  return new FallbackClaudeClient({ primary: sdkClient, fallback: createClaudeCliClient(config) });
+  return new FallbackClaudeClient({ primary: sdkClient, fallback: createClaudeCliClient(config, env) });
 }
 
-function createClaudeCliClient(config) {
+/**
+ * The environment every Claude Code child runs under.
+ *
+ * Built from this process's own environment, so PATH and everything else
+ * survives, with one addition when a gateway endpoint was configured. The base
+ * URL is the only thing this sets: authentication stays whatever Claude Code
+ * already owns, so the subscription credential is neither read nor replaced.
+ */
+function claudeEnv(config) {
+  if (!config.bifrostBaseUrl) return undefined;
+  return { ...process.env, ANTHROPIC_BASE_URL: config.bifrostBaseUrl };
+}
+
+function createClaudeCliClient(config, env = undefined) {
   return new ClaudeCliClient({
     command: config.command ?? "claude",
     args: config.args ?? [],
+    ...(env ? { env } : {}),
     requestTimeoutMs: positiveInteger(config.requestTimeoutMs, 30 * 60_000),
   });
 }

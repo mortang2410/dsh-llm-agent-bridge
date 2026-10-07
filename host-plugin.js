@@ -15,10 +15,16 @@ export async function apply(ctx, config = {}) {
   const host = new PluginHost();
   const release = ctx.effect(() => () => host.dispose(), "agent-bridge()");
   try {
+    if (config.bifrostBaseUrl) {
+      // One line, once, so a run's routing is provable from the log. No
+      // credentials or authorization headers are ever logged.
+      ctx.logger?.info?.(`Claude transport endpoint: ${config.bifrostBaseUrl}`);
+    }
     await host.activate([
       createClaudeExecutionPlugin({
         client: config.claude?.client, backend: config.claudeBackend, command: config.claudeCommand,
         args: config.claudeArgs, codeExecutablePath: config.claudeCodeExecutablePath,
+        bifrostBaseUrl: config.bifrostBaseUrl,
         requestTimeoutMs: config.claudeRequestTimeoutMs, cwd: config.cwd,
       }),
       createDshClaudePlugin(ctx, config),

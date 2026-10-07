@@ -207,3 +207,74 @@ test("with telemetry: ignore, activation does not even read the exporter", async
   assert.equal(reads.includes("sessionTelemetry"), false);
   await host.dispose();
 });
+
+test("a configured gateway endpoint becomes the Claude child's ANTHROPIC_BASE_URL", async (context) => {
+  const { createClaudeExecutionPlugin } = await import("../plugin.mjs");
+  const { mkdtemp, readFile, rm, writeFile } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+
+  const directory = await mkdtemp(join(tmpdir(), "agent-bridge-env-"));
+  context.after(() => rm(directory, { recursive: true, force: true }));
+  const envPath = join(directory, "env.json");
+  const scriptPath = join(directory, "fake-claude.mjs");
+  await writeFile(scriptPath, `
+import { writeFileSync } from "node:fs";
+writeFileSync(process.argv[2], JSON.stringify({
+  baseUrl: process.env.ANTHROPIC_BASE_URL ?? null,
+  apiKey: process.env.ANTHROPIC_API_KEY ?? null,
+  authToken: process.env.ANTHROPIC_AUTH_TOKEN ?? null,
+  hasPath: typeof process.env.PATH === "string" && process.env.PATH.length > 0,
+}));
+console.log(JSON.stringify({ type: "result", result: "ok" }));
+`);
+
+  // No `client` override: the plugin must build it from the config, which is the
+  // wiring under test. The CLI backend makes the resulting child environment
+  // observable without spending an inference request.
+  const host = new PluginHost();
+  await host.activate([createClaudeExecutionPlugin({
+    backend: "cli",
+    command: process.execPath,
+    args: [scriptPath, envPath],
+    bifrostBaseUrl: "http://127.0.0.1:8090/anthropic",
+    cwd: directory,
+  })]);
+  const capability = host.capabilities.require("agent-bridge.execution.v1", "^1.0.0");
+  await capability.whenReady();
+
+  const session = await capability.createSession({ sessionId: "s-gateway", cwd: directory });
+  const completed = new Promise(resolve => {
+    capability.subscribeActivity(message => { if (message.method === "turn/completed") resolve(message); });
+  });
+  await capability.sendMessage(session.id, { text: "hi" });
+  await completed;
+
+  const seen = JSON.parse(await readFile(envPath, "utf8"));
+  assert.equal(seen.baseUrl, "http://127.0.0.1:8090/anthropic");
+  assert.equal(seen.hasPath, true, "ordinary environment variables survive");
+  assert.equal(seen.apiKey, null, "no API key is invented");
+  assert.equal(seen.authToken, null, "no auth token is invented");
+  await host.dispose();
+});
+
+test("bridge initialization logs the transport endpoint once, and never a credential", async () => {
+  const { createClaudeExecutionPlugin } = await import("../plugin.mjs");
+  const { createDshClaudePlugin } = await import("../dsh-plugin.js");
+  const { apply } = await import("../host-plugin.js");
+
+  const infos = [];
+  const ctx = {
+    logger: { info: message => infos.push(message), warn() {}, error() {} },
+    llm: { registerAdapter: () => () => {} },
+    agents: { list: () => [], get: () => null },
+    on: () => () => {},
+    effect: () => () => {},
+    inject: () => ({ dispose() {} }),
+  };
+
+  await apply(ctx, { claudeBackend: "sdk", bifrostBaseUrl: "http://127.0.0.1:8090/anthropic" });
+
+  assert.deepEqual(infos, ["Claude transport endpoint: http://127.0.0.1:8090/anthropic"]);
+  assert.equal(infos.some(line => /sk-ant|Bearer|authorization|AUTH_TOKEN|API_KEY/i.test(line)), false);
+});

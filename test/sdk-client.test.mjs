@@ -395,3 +395,45 @@ test("readable reasoning is requested, and opting out asks for nothing", async (
   await client.sendMessage(session.id, { text: "hi", thinkingSummaries: false });
   assert.equal(captured.thinking, undefined, "opting out leaves the SDK's own default alone");
 });
+
+test("a configured gateway endpoint reaches every SDK query, keeping the rest of the environment", async () => {
+  const captured = [];
+  const sdk = {
+    query(params) {
+      captured.push(params.options);
+      return Object.assign((async function* () {})(), {
+        close() {},
+        interrupt: async () => {},
+        async supportedModels() { return []; },
+        async usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET() { return null; },
+      });
+    },
+  };
+  const env = { ...process.env, ANTHROPIC_BASE_URL: "http://127.0.0.1:8090/anthropic" };
+  const client = new ClaudeSdkClient({ sdk, env });
+
+  const session = await client.createSession({ sessionId: "s-bifrost" });
+  await client.sendMessage(session.id, { text: "hi" });
+  await client.fetchSupportedModels();
+  await client.planUsage();
+
+  assert.equal(captured.length, 3, "the turn, the catalog read, and the plan read all ran");
+  for (const options of captured) {
+    assert.equal(options.env.ANTHROPIC_BASE_URL, "http://127.0.0.1:8090/anthropic");
+    assert.equal(options.env.PATH, process.env.PATH, "ordinary environment variables survive");
+    assert.equal(options.env.ANTHROPIC_API_KEY, undefined, "no API key is invented");
+    assert.equal(options.env.ANTHROPIC_AUTH_TOKEN, undefined, "no auth token is invented");
+  }
+});
+
+test("an unconfigured client leaves the SDK's own environment default alone", async () => {
+  let captured = null;
+  const sdk = {
+    query(params) { captured = params.options; return Object.assign((async function* () {})(), { close() {}, interrupt: async () => {} }); },
+  };
+  const client = new ClaudeSdkClient({ sdk });
+  const session = await client.createSession({ sessionId: "s-no-gateway" });
+  await client.sendMessage(session.id, { text: "hi" });
+
+  assert.equal(captured.env, undefined, "the SDK default is not overridden with process.env");
+});
