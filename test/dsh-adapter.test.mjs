@@ -935,3 +935,21 @@ test("usage that arrives after its turn has ended does not bring its ledger back
   runtime.emit("activity", notification("usage/apiCall", sessionId, "turn-1", { callId: "late", usage: { input_tokens: 9 } }));
   assert.equal(adapter.usageLedgers.size, 0, "a late report for a finished turn is not recorded");
 });
+
+test("a turn whose consumer stopped early leaves no ledger once it completes", async () => {
+  const runtime = new FakeRuntime();
+  const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve() });
+  const agent = fakeAgent();
+  adapter.attachAgent(agent);
+  for await (const chunk of adapter.stream({
+    provider: "claude",
+    model: "sonnet",
+    sessionId: agent.id,
+    messages: [{ role: "user", source: { kind: "user" }, content: [{ type: "text", text: "hi" }] }],
+  })) {
+    assert.ok(chunk, "the first chunk arrives");
+    break;
+  }
+  await new Promise(resolve => setTimeout(resolve, 5));
+  assert.equal(adapter.usageLedgers.size, 0, "completion with no live reader drops the ledger");
+});

@@ -27,6 +27,10 @@ export class ClaudeDshAdapter extends LlmAdapter {
     // Claude sessions whose turns this adapter is running or has suspended. Only their
     // usage is recorded, so an adapter sharing a runtime never keeps another's turns.
     this.ownedSessions = new Set();
+    // Claude sessions whose turn is being read by a live step right now.
+    this.readers = new Set();
+    // Turns that have finished; a late report for one of them is never recorded.
+    this.finishedTurns = new Set();
     // Usage is recorded for the life of each owned turn, including the gap while a
     // parked step waits for DSH to run its tools, so no report is lost to that gap.
     this.usageUnsubscribe = null;
@@ -51,6 +55,8 @@ export class ClaudeDshAdapter extends LlmAdapter {
     this.usageUnsubscribe = null;
     this.usageLedgers.clear();
     this.ownedSessions.clear();
+    this.readers.clear();
+    this.finishedTurns.clear();
   }
 
   providerInfo() {
@@ -281,10 +287,11 @@ export class ClaudeDshAdapter extends LlmAdapter {
     const stopActivity = subscribeRuntimeActivity(this.runtime, onActivity);
     let turnId = null;
     this.ownedSessions.add(claudeSessionId);
+    this.readers.add(claudeSessionId);
     try {
       turnId = await start();
       debugLog("turn/started", { sessionId, claudeSessionId, turnId });
-      const state = createStreamState(this.usageLedgerFor(turnId));
+      const state = createStreamState(this.usageLedgerFor(turnId, claudeSessionId));
       let completedTurn = null;
       let batch = null;
       let first = true;
@@ -367,7 +374,8 @@ export class ClaudeDshAdapter extends LlmAdapter {
     } finally {
       stopActivity();
       queue.close();
-      if (turnId && this.usageLedgers.get(turnId)?.completed && !this.suspended.has(sessionId)) {
+      this.readers.delete(claudeSessionId);
+      if (turnId && (this.usageLedgers.get(turnId)?.completed || this.finishedTurns.has(turnId)) && !this.suspended.has(sessionId)) {
         this.usageLedgers.delete(turnId);
       }
     }
@@ -375,15 +383,18 @@ export class ClaudeDshAdapter extends LlmAdapter {
 
   /** Forget a turn's ledger and its Claude session, once nothing more will report usage for them. */
   releaseTurn(claudeSessionId, turnId) {
-    if (turnId) this.usageLedgers.delete(turnId);
+    this.rememberFinished(turnId);
+    for (const [id, ledger] of this.usageLedgers) {
+      if (ledger.sessionId === claudeSessionId || id === turnId) this.usageLedgers.delete(id);
+    }
     this.ownedSessions.delete(claudeSessionId);
+    this.readers.delete(claudeSessionId);
   }
 
   /** Release a Claude turn nobody is going to finish, and unpark its tool calls. */
   async abandonTurn(sessionId, { claudeSessionId, turnId }) {
     this.suspended.delete(sessionId);
-    if (turnId) this.usageLedgers.delete(turnId);
-    this.ownedSessions.delete(claudeSessionId);
+    this.releaseTurn(claudeSessionId, turnId);
     this.runtime.rejectAllToolCalls?.(new Error("The DSH turn was abandoned before the tool result arrived"));
     if (turnId) await this.runtime.interruptTurn(claudeSessionId, turnId).catch(() => {});
   }
@@ -520,24 +531,35 @@ export class ClaudeDshAdapter extends LlmAdapter {
     const { sessionId } = message?.params ?? {};
     if (!this.ownedSessions.has(sessionId)) return;
     if (message.method === "turn/completed") {
-      // A completed turn reports no more usage. Its ledger stays until the step that
-      // completes the turn has read it; the session is released now.
-      const ledger = this.usageLedgers.get(message.params?.turn?.id);
-      if (ledger) ledger.completed = true;
+      const turnId = message.params?.turn?.id;
       this.ownedSessions.delete(sessionId);
+      if (!turnId) return;
+      this.rememberFinished(turnId);
+      const ledger = this.usageLedgers.get(turnId);
+      if (!ledger) return;
+      ledger.completed = true;
+      // A live step deletes the ledger after reading it. With no live step, nothing will.
+      if (!this.readers.has(ledger.sessionId)) this.usageLedgers.delete(turnId);
       return;
     }
     if (!String(message?.method).startsWith("usage/")) return;
     const turnId = message.params?.turnId;
+    if (!turnId || this.finishedTurns.has(turnId)) return;
+    recordUsage({ usage: this.usageLedgerFor(turnId, sessionId) }, message);
+  }
+
+  /** Remember a finished turn, bounded, so its late reports are refused. */
+  rememberFinished(turnId) {
     if (!turnId) return;
-    recordUsage({ usage: this.usageLedgerFor(turnId) }, message);
+    this.finishedTurns.add(turnId);
+    if (this.finishedTurns.size > 256) this.finishedTurns.delete(this.finishedTurns.values().next().value);
   }
 
   /** The turn's usage ledger, which outlives each step while the turn is parked. */
-  usageLedgerFor(turnId) {
+  usageLedgerFor(turnId, sessionId) {
     let ledger = this.usageLedgers.get(turnId);
     if (!ledger) {
-      ledger = newUsageLedger();
+      ledger = newUsageLedger(sessionId);
       this.usageLedgers.set(turnId, ledger);
     }
     return ledger;
@@ -779,8 +801,8 @@ function createStreamState(usage = newUsageLedger()) {
 }
 
 /** Usage bookkeeping for one Claude turn. */
-function newUsageLedger() {
-  return { calls: new Map(), reported: new Map(), ended: new Set(), toolUses: new Map() };
+function newUsageLedger(sessionId = null) {
+  return { sessionId, completed: false, calls: new Map(), reported: new Map(), ended: new Set(), toolUses: new Map() };
 }
 
 /** How long a parked step waits for its model calls to finish reporting usage. */
