@@ -160,6 +160,7 @@ test("Claude SDK maps generic DSH schemas to an in-process MCP server", async ()
   await untilTurnCompleted(activity);
 
   assert.deepEqual(Object.keys(queryParams.options.mcpServers), ["dsh"]);
+  assert.equal(queryParams.options.strictMcpConfig, true, "claude.ai connectors must not add tools DSH cannot see");
   assert.deepEqual(queryParams.options.allowedTools, ["mcp__dsh__cross_plugin_probe"], "DSH's tool runtime owns the approval decision, not the SDK layer");
   assert.equal(serverOptions.tools[0].name, "cross_plugin_probe");
   assert.equal(serverOptions.tools[0].inputSchema.value.isOptional(), false);
@@ -434,7 +435,10 @@ test("Anthropic's usage shape maps onto the harness's, cache split intact", asyn
 test("context capacity is learned from result messages and defaulted until then", async () => {
   const client = new ClaudeSdkClient({ sdk: {} });
 
-  assert.equal(client.contextWindowFor("haiku"), 200000, "a sane default before any turn has run");
+  assert.equal(client.contextWindowFor("opus", "claude-opus-5-5"), 1000000, "current models default to 1M before any turn has run");
+  assert.equal(client.contextWindowFor("sonnet", "claude-sonnet-5-5"), 1000000);
+  assert.equal(client.contextWindowFor("claude-sonnet-4-6", "claude-sonnet-4-6"), 200000, "untagged 4.x rows stay at 200k");
+  assert.equal(client.contextWindowFor("claude-haiku-4-5-20251001"), 200000);
   assert.equal(client.contextWindowFor("opus[1m]", "claude-opus-5[1m]"), 1000000, "the long-context rows are recognised");
 
   client.learnContextWindows({

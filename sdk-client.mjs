@@ -204,8 +204,12 @@ export class ClaudeSdkClient extends EventEmitter {
       const learned = this.contextWindows.get(key) ?? this.contextWindows.get(stripTag(key));
       if (learned) return learned;
     }
-    // Until a turn has run: the [1m] rows are the long-context variants.
-    return /\[1m\]$/.test(String(resolvedModel ?? model)) ? 1_000_000 : 200_000;
+    // Until a turn has run: current models (5.x, including the bare `opus`,
+    // `sonnet` and `haiku` aliases) report 1M. Only untagged 4.x-and-older ids
+    // are 200k; their long-context variants carry an explicit [1m] tag.
+    const id = String(resolvedModel ?? model);
+    if (/\[1m\]$/.test(id)) return 1_000_000;
+    return /^claude-(?:haiku|sonnet|opus)-[1-4](?:\D|$)|^claude-[1-4]/.test(id) ? 200_000 : 1_000_000;
   }
 
 /**
@@ -484,8 +488,13 @@ export class ClaudeSdkClient extends EventEmitter {
 }
 
 function dshMcpOptions(sdk, message, park) {
+  // Use only the MCP servers passed here. Without this, a claude.ai login makes
+  // Claude Code add every claude.ai connector (Gmail, Calendar, Drive, ...) to
+  // each request: about 90k tokens DSH never sees, so its context meter and the
+  // real prompt disagree. Passing mcpServers alone does not suppress connectors.
+  const strict = { strictMcpConfig: true };
   const schemas = message.dshTools;
-  if (!Array.isArray(schemas) || schemas.length === 0) return {};
+  if (!Array.isArray(schemas) || schemas.length === 0) return strict;
   if (typeof sdk.createSdkMcpServer !== "function" || typeof sdk.tool !== "function") {
     throw new Error("This Claude Agent SDK does not support in-process DSH tools");
   }
@@ -500,6 +509,7 @@ function dshMcpOptions(sdk, message, park) {
     async args => park(schema.name, args),
   ));
   return {
+    ...strict,
     mcpServers: {
       dsh: sdk.createSdkMcpServer({ name: "dsh", version: "1.0.0", tools, alwaysLoad: true }),
     },
