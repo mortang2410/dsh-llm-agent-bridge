@@ -238,7 +238,7 @@ export class ClaudeDshAdapter extends LlmAdapter {
             }
           }
           return suspended.turnId;
-        }, { firstEventTimeoutMs: resumeTimeoutMs() });
+        }, { firstEventTimeoutMs: resumeTimeoutMs(), knownTurnId: suspended.turnId });
         return;
       }
       debugLog("abandon", { sessionId, turnId: suspended.turnId, expected: suspended.calls });
@@ -276,7 +276,7 @@ export class ClaudeDshAdapter extends LlmAdapter {
    * recorded in its trajectory — and then calls back into `stream()` with the
    * results, which resume the same Claude query.
    */
-  async *runTurn(agent, sessionId, claudeSessionId, options, start, { firstEventTimeoutMs = 0 } = {}) {
+  async *runTurn(agent, sessionId, claudeSessionId, options, start, { firstEventTimeoutMs = 0, knownTurnId = null } = {}) {
     const queue = new ActivityQueue(options.signal, "Claude");
     const onActivity = (message) => {
       const candidate = message.params?.sessionId ?? message.params?.session?.id;
@@ -285,7 +285,8 @@ export class ClaudeDshAdapter extends LlmAdapter {
     // Subscribe before starting or resuming: a runtime that emits synchronously
     // would otherwise deliver the whole turn before anyone is listening.
     const stopActivity = subscribeRuntimeActivity(this.runtime, onActivity);
-    let turnId = null;
+    // A resumed turn already has its id, so a failure to start it still releases that turn.
+    let turnId = knownTurnId;
     this.ownedSessions.add(claudeSessionId);
     this.readers.add(claudeSessionId);
     try {

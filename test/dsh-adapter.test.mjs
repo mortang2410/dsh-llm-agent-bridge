@@ -491,6 +491,30 @@ test("a resumed turn that never speaks fails instead of stalling forever", async
   }
 });
 
+test("a resume that cannot start releases the turn's usage, and nothing is left behind", async () => {
+  const runtime = new FakeRuntime();
+  runtime.resolveToolCall = () => false;
+  const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve() });
+  const agent = fakeAgent();
+  adapter.attachAgent(agent);
+
+  const messages = [{ role: "user", source: { kind: "user" }, content: [{ type: "text", text: "go" }] }];
+  const request = {
+    provider: "claude",
+    model: "sonnet",
+    sessionId: agent.id,
+    messages,
+    tools: [{ name: "bash", description: "run", parameters: { type: "object", properties: {} } }],
+  };
+  const first = await collect(adapter.stream(request));
+  const call = first.find(chunk => chunk.type === "block-end" && chunk.block.type === "tool-call");
+  await assert.rejects(() => collect(adapter.stream({
+    ...request,
+    messages: [...messages, { role: "user", content: [{ type: "tool-result", toolCallId: call.block.id, content: [] }] }],
+  })), /No Claude tool call is waiting/);
+  assert.equal(adapter.usageLedgers.size, 0, "the failed resume released its turn's ledger, even though it never started");
+});
+
 test("a result nothing is waiting for fails the turn rather than parking it", async () => {
   const runtime = new FakeRuntime();
   runtime.resolveToolCall = () => false;
