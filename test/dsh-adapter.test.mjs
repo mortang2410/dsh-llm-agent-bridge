@@ -176,6 +176,50 @@ test("concurrent first messages create exactly one Claude session", async () => 
   assert.equal(runtime.created, 1);
 });
 
+test("the session log's sandbox and approval events reach the runtime config", async () => {
+  // The adapter reads DSH's session log to decide the sandbox and approval
+  // policy it hands the child. Nothing else in this file appends those events,
+  // so without this test the log could regress to always reading empty and the
+  // suite would stay green while a real read-only or `never` policy was silently
+  // replaced by the adapter's own defaults.
+  const runtime = new FakeRuntime();
+  const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve() });
+  const agent = fakeAgent();
+  agent.session.append("sandbox/mode", { mode: "read-only" });
+  agent.session.append("approval/policy", { policy: "never" });
+  adapter.attachAgent(agent);
+
+  const chunks = await collect(adapter.stream({
+    provider: "claude",
+    model: "sonnet",
+    sessionId: agent.id,
+    messages: [{ role: "user", source: { kind: "user" }, content: [{ type: "text", text: "list the files" }] }],
+  }));
+
+  assert.equal(chunks.at(-1).reason.kind, "stop");
+  const config = runtime.sent[0].message;
+  assert.equal(config.sandbox, "read-only", "DSH's sandbox choice must survive into the Claude config");
+  assert.equal(config.approvalPolicy, "never", "DSH's approval choice must survive into the Claude config");
+});
+
+test("without permission events the adapter applies its own documented defaults", async () => {
+  const runtime = new FakeRuntime();
+  const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve() });
+  const agent = fakeAgent();
+  adapter.attachAgent(agent);
+
+  await collect(adapter.stream({
+    provider: "claude",
+    model: "sonnet",
+    sessionId: agent.id,
+    messages: [{ role: "user", source: { kind: "user" }, content: [{ type: "text", text: "list the files" }] }],
+  }));
+
+  const config = runtime.sent[0].message;
+  assert.equal(config.sandbox, "workspace-write", "the default is the permissive-but-scoped sandbox");
+  assert.equal(config.approvalPolicy, "on-request", "and the default asks before acting");
+});
+
 test("Claude SDK permission and question requests use DSH services", async () => {
   const agent = fakeAgent();
   const adapter = { dshSessionForClaudeSession: sessionId => sessionId === "claude-1" ? agent.id : null };

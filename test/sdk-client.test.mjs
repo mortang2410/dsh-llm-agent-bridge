@@ -396,6 +396,26 @@ test("readable reasoning is requested, and opting out asks for nothing", async (
   assert.equal(captured.thinking, undefined, "opting out leaves the SDK's own default alone");
 });
 
+test("a requested effort is sent, and an unset effort is not sent at all", async () => {
+  let captured = null;
+  const sdk = {
+    query(params) { captured = params.options; return Object.assign((async function* () {})(), { close() {}, interrupt: async () => {} }); },
+  };
+  const client = new ClaudeSdkClient({ sdk });
+  const session = await client.createSession({ sessionId: "s-effort" });
+
+  await client.sendMessage(session.id, { text: "hi", model: "haiku", effort: "low" });
+  assert.equal(captured.model, "haiku", "the requested model reaches the SDK verbatim");
+  assert.equal(captured.effort, "low", "the requested effort reaches the SDK verbatim");
+
+  // An absent effort must stay absent rather than travel as `undefined`, so the
+  // SDK applies Claude Code's own default. Sending the key at all changes which
+  // default the child picks, so this is a behavioural contract, not tidiness.
+  await client.sendMessage(session.id, { text: "hi", model: "haiku" });
+  assert.equal(captured.model, "haiku");
+  assert.equal("effort" in captured, false, "an unset effort must not be sent at all");
+});
+
 test("a configured gateway endpoint reaches every SDK query, keeping the rest of the environment", async () => {
   const captured = [];
   const sdk = {

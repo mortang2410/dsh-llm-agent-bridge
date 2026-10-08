@@ -90,6 +90,14 @@ test("Claude's DSH tool call runs in the harness and the same parked query resum
   );
   assert.equal(model.queryCount, 1, "one Claude query spans both halves of the turn");
 
+  // The requested model and effort must reach the SDK unchanged. Asserting them
+  // here is what makes this test a contract: without it the turn still passes
+  // when the bridge substitutes a different model or drops the effort, which is
+  // exactly the substitution the operator's constraint forbids.
+  assert.equal(model.turnOptions.length, 1, "the turn's SDK options are captured");
+  assert.equal(model.turnOptions[0].model, "haiku", "the requested model reaches the SDK verbatim");
+  assert.equal(model.turnOptions[0].effort, "low", "the requested effort reaches the SDK verbatim");
+
   // Step 2: DSH's agent loop runs the call and records it. That loop lives in
   // the host, not in this repository, so the driver performs it here — but it
   // records into the same DSH agent session the bridge is attached to, and the
@@ -144,6 +152,10 @@ function fakeModelSdk({ toolName, args }) {
     sessionId: "claude-session-1",
     handlerResult: null,
     settled: false,
+    // Every turn's SDK options, captured so a test can assert what actually
+    // went on the wire. Without this the suite passes even if the bridge drops
+    // the requested model or effort: the fake SDK never looks at them.
+    turnOptions: [],
   };
   const sdk = {
     createSdkMcpServer(options) {
@@ -160,6 +172,7 @@ function fakeModelSdk({ toolName, args }) {
       if (params.options.abortController) {
         state.queryCount += 1;
         state.sessionId = params.options.sessionId;
+        state.turnOptions.push(structuredClone(params.options));
       }
       return queryObject(async function* () {
         // The model's decision: ask DSH to read the file. This is the bridged
@@ -193,6 +206,7 @@ function fakeModelSdk({ toolName, args }) {
     get queryCount() { return state.queryCount; },
     get sessionId() { return state.sessionId; },
     get handlerResult() { return state.handlerResult; },
+    get turnOptions() { return state.turnOptions; },
     handlerSettled: () => state.settled,
   };
 }
