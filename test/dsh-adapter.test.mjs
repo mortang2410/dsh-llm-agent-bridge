@@ -332,6 +332,138 @@ test("DSH's mid-turn context splices never swallow the instruction", async () =>
   assert.doesNotMatch(sent, /do not act on them/i, "current-turn context must not be labelled as inert history");
 });
 
+const CHECKPOINT = "CHECKPOINT: the compacted summary of the earlier work";
+
+function userMessage(text) {
+  return { role: "user", source: { kind: "user" }, content: [{ type: "text", text }] };
+}
+
+function replyMessage(text) {
+  return { role: "assistant", content: [{ type: "text", text }] };
+}
+
+/** The message DSH's compaction puts in place of the span it shadowed. */
+function checkpointMessage() {
+  return { role: "user", source: { kind: "compaction" }, content: [{ type: "text", text: CHECKPOINT }] };
+}
+
+test("after DSH compacts history Claude already holds, the next request starts a new Claude session seeded from the compacted history", async () => {
+  const runtime = new FakeRuntime();
+  const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve() });
+  const agent = fakeAgent();
+  adapter.attachAgent(agent);
+
+  agent.session.append("user/message", {});
+  await collect(adapter.stream({ provider: "claude", model: "sonnet", sessionId: agent.id, messages: [userMessage("first question")] }));
+
+  // DSH records Claude's reply, then compacts the span it has seen into one checkpoint.
+  agent.session.append("assistant/message", {});
+  agent.session.append("compaction/summary", { shadowedSeqs: [1, 2] });
+  agent.session.append("user/message", {}, { surfaceOp: { op: "replace", startSeq: 1, endSeq: 2 } });
+
+  await collect(adapter.stream({
+    provider: "claude", model: "sonnet", sessionId: agent.id,
+    messages: [checkpointMessage(), userMessage("second question")],
+  }));
+
+  assert.equal(runtime.createdConfigs.length, 2, "the old transcript still holds the uncompacted history, so Claude must start over");
+  assert.deepEqual(runtime.released, ["claude-1"], "the old Claude session is released, not left running");
+  const sent = runtime.sent[1].message.text;
+  assert.ok(sent.includes(CHECKPOINT), "the compacted history must reach Claude");
+  assert.match(sent, /second question$/, "with the live question last");
+});
+
+test("a compaction while a Claude turn waits on a tool result fails only that parked call and continues in a new session", async () => {
+  const runtime = new FakeRuntime();
+  const rejected = [];
+  runtime.rejectToolCall = (parkId) => { rejected.push(parkId); return true; };
+  const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve() });
+  const agent = fakeAgent();
+  adapter.attachAgent(agent);
+  const tools = [{ name: "bash", description: "Run a command.", parameters: { type: "object", properties: { command: { type: "string" } } } }];
+
+  agent.session.append("user/message", {});
+  const first = await collect(adapter.stream({ provider: "claude", model: "sonnet", sessionId: agent.id, messages: [userMessage("go")], tools }));
+  const call = first.find(chunk => chunk.type === "block-end" && chunk.block.type === "tool-call");
+  assert.ok(call, "the first request must park on a tool call");
+
+  // DSH runs the tool, then compacts the span up to and including its result.
+  agent.session.append("assistant/message", {});
+  agent.session.append("tool/result", {});
+  agent.session.append("compaction/summary", { shadowedSeqs: [1, 2, 3] });
+  agent.session.append("user/message", {}, { surfaceOp: { op: "replace", startSeq: 1, endSeq: 3 } });
+
+  const result = { role: "user", content: [{ type: "tool-result", toolCallId: call.block.id, content: [{ type: "text", text: "/workspace/dsh" }] }] };
+  const second = await collect(adapter.stream({
+    provider: "claude", model: "sonnet", sessionId: agent.id,
+    messages: [checkpointMessage(), result],
+  }));
+
+  assert.deepEqual(runtime.resolved, [], "the result must not be fed into the transcript Claude no longer shares with DSH");
+  assert.deepEqual(rejected, ["park-1"], "only this turn's parked call is failed");
+  assert.equal(runtime.createdConfigs.length, 2, "the continuation runs in a new Claude session");
+  const sent = runtime.sent[1].message.text;
+  assert.ok(sent.includes(CHECKPOINT), "the compacted history must reach the new session");
+  assert.ok(sent.includes("tool result: /workspace/dsh"), "the tool result DSH recorded must reach the new session");
+  assert.match(sent, /do not repeat/i, "the continuation must not re-run the tool call that already ran");
+  assert.equal(second.at(-1).reason.kind, "stop");
+});
+
+test("a plain follow-up keeps the Claude session, and rewriting only the system prompt does not reset it", async () => {
+  const runtime = new FakeRuntime();
+  const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve() });
+  const agent = fakeAgent();
+  adapter.attachAgent(agent);
+
+  agent.session.append("user/message", {});
+  await collect(adapter.stream({ provider: "claude", model: "sonnet", sessionId: agent.id, messages: [userMessage("first question")] }));
+  agent.session.append("assistant/message", {});
+  agent.session.append("system/message", {}, { surfaceOp: { op: "replace", startSeq: 1, endSeq: 1 } });
+  agent.session.append("user/message", {});
+  await collect(adapter.stream({
+    provider: "claude", model: "sonnet", sessionId: agent.id,
+    messages: [userMessage("first question"), replyMessage("done"), userMessage("second question")],
+  }));
+
+  assert.equal(runtime.createdConfigs.length, 1, "no DSH history was compacted, so the transcript still matches");
+  assert.deepEqual(runtime.released, []);
+});
+
+test("a rewrite Claude already built on does not reset the session again after a host restart", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "claude-links-"));
+  const path = join(dir, "links.json");
+  try {
+    const runtime = new FakeRuntime();
+    const agent = fakeAgent();
+    const before = new ClaudeDshAdapter({ runtime, ready: Promise.resolve(), linkStore: new ClaudeLinkStore(path) });
+    before.attachAgent(agent);
+
+    agent.session.append("user/message", {});
+    await collect(before.stream({ provider: "claude", model: "sonnet", sessionId: agent.id, messages: [userMessage("first question")] }));
+    agent.session.append("compaction/summary", { shadowedSeqs: [1] });
+    agent.session.append("user/message", {}, { surfaceOp: { op: "replace", startSeq: 1, endSeq: 1 } });
+    await collect(before.stream({
+      provider: "claude", model: "sonnet", sessionId: agent.id,
+      messages: [checkpointMessage(), userMessage("second question")],
+    }));
+    assert.equal(runtime.createdConfigs.length, 2);
+
+    // The host restarts. Nothing has been rewritten since Claude was last sent a prompt.
+    agent.session.append("assistant/message", {});
+    agent.session.append("user/message", {});
+    const after = new ClaudeDshAdapter({ runtime, ready: Promise.resolve(), linkStore: new ClaudeLinkStore(path) });
+    after.attachAgent(agent);
+    await collect(after.stream({
+      provider: "claude", model: "sonnet", sessionId: agent.id,
+      messages: [checkpointMessage(), userMessage("second question"), replyMessage("done"), userMessage("third question")],
+    }));
+
+    assert.equal(runtime.createdConfigs.length, 2, "the rewrite is behind Claude's last prompt, so the session must be kept");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 class FakeRuntime extends EventEmitter {
   constructor() {
     super();
@@ -442,7 +574,12 @@ function fakeAgent({ tools = null } = {}) {
       // `events` field. A double that invents one hides a real adapter bug, so
       // append() writes the same array the adapter reads.
       log: [],
-      append(type, data) { appended.push({ type, data }); this.log.push({ type, data }); },
+      // Each event carries the `seq`, and for a rewrite of earlier history the
+      // `surfaceOp` range, as DSH's real log records them.
+      append(type, data, { surfaceOp } = {}) {
+        appended.push({ type, data });
+        this.log.push({ seq: this.log.length + 1, type, data, ...(surfaceOp === undefined ? {} : { surfaceOp }) });
+      },
     },
   };
 }

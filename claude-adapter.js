@@ -7,6 +7,9 @@ import { scanOnlyTelemetryControl } from "./telemetry-control.js";
 // Identification, not branding: the row names the thing it invokes.
 export const CLAUDE_PROVIDER = "claude";
 
+/** Appended when a parked turn continues in a new Claude session after DSH rewrote its history. */
+const PARKED_TURN_NOTE = "Earlier tool calls for this request already ran. Their results, or the summary of them, are in the context above; continue from them and do not repeat those calls.";
+
 export class ClaudeDshAdapter extends LlmAdapter {
   constructor({ runtime, ready, linkStore = null, logger = console, telemetry = scanOnlyTelemetryControl(), thinkingSummaries = true }) {
     super();
@@ -21,6 +24,9 @@ export class ClaudeDshAdapter extends LlmAdapter {
     this.pendingSessions = new Map();
     this.agents = new Map();
     this.seen = new Map();
+    // The DSH log position (seq) that each Claude transcript was last sent up to. A rewrite of
+    // DSH history at or before that position means the transcript no longer matches DSH.
+    this.builtAt = new Map();
     // DSH sessions whose Claude turn is parked on tool calls DSH is executing.
     this.suspended = new Map();
     this.usageLedgers = new Map();
@@ -46,6 +52,7 @@ export class ClaudeDshAdapter extends LlmAdapter {
       if (claudeSessionId) this.links.set(sessionId, claudeSessionId);
       this.settings.set(sessionId, record.config);
       if (Number.isSafeInteger(record.seen)) this.seen.set(sessionId, record.seen);
+      if (Number.isSafeInteger(record.surfaceSeq)) this.builtAt.set(sessionId, record.surfaceSeq);
     }
   }
 
@@ -187,6 +194,7 @@ export class ClaudeDshAdapter extends LlmAdapter {
       claudeSessionId: this.links.get(sessionId) ?? null,
       config: this.configuration(sessionId),
       seen: this.seen.get(String(sessionId)) ?? 0,
+      surfaceSeq: this.builtAt.get(String(sessionId)) ?? null,
     });
   }
 
@@ -212,21 +220,34 @@ export class ClaudeDshAdapter extends LlmAdapter {
     const agent = this.agents.get(sessionId);
     if (!agent) throw new Error(`The Claude adapter has no attached agent for ${sessionId}`);
 
-    // A turn suspended on tool calls resumes here: DSH ran them and is calling
-    // back with the results, so the same Claude query continues rather than a
-    // new one starting.
-    const suspended = this.suspended.get(sessionId);
+    // DSH may have rewritten history that the Claude transcript already holds, most
+    // often by compacting its context. Continuing that transcript would send the old
+    // context again, so a parked turn is released and this request starts a new Claude
+    // session from DSH's history.
+    let suspended = this.suspended.get(sessionId);
+    const rewritten = this.historyRewritten(sessionId, agent);
+    const parkedTurnRewritten = rewritten && Boolean(suspended);
+    if (rewritten) {
+      if (suspended) await this.releaseParkedTurn(sessionId, suspended);
+      suspended = undefined;
+      await this.retireClaudeSession(sessionId);
+    }
     debugLog("stream", {
       sessionId,
       messages: options.messages?.length ?? 0,
       tools: options.tools?.length ?? 0,
       suspended: suspended ? suspended.calls : null,
       toolResultIds: allToolResultIds(options.messages),
+      rewritten,
     });
+    // A turn suspended on tool calls resumes here: DSH ran them and is calling
+    // back with the results, so the same Claude query continues rather than a
+    // new one starting.
     if (suspended) {
       const results = toolResultsFor(options.messages, suspended.calls);
       if (results.length) {
         debugLog("resume", { sessionId, turnId: suspended.turnId, resolving: results.map(result => result.toolCallId) });
+        this.markBuilt(sessionId, agent);
         yield* this.runTurn(agent, sessionId, suspended.claudeSessionId, options, async () => {
           for (const result of results) {
             const delivered = this.runtime.resolveToolCall(result.toolCallId, dshToolResult(result));
@@ -260,7 +281,9 @@ export class ClaudeDshAdapter extends LlmAdapter {
     });
     const dshTools = structuredClone(options.tools ?? []);
     const claudeSessionId = await this.ensureSession(sessionId);
-    const prompt = this.seedPrompt(sessionId, options.messages, instruction, text);
+    const seeded = this.seedPrompt(sessionId, options.messages, instruction, text);
+    const prompt = parkedTurnRewritten ? `${seeded}\n\n${PARKED_TURN_NOTE}` : seeded;
+    this.markBuilt(sessionId, agent);
     yield* this.runTurn(agent, sessionId, claudeSessionId, options, async () => {
       const started = await this.runtime.sendMessage(claudeSessionId, { text: prompt, ...config, dshTools });
       return started.id;
@@ -397,6 +420,63 @@ export class ClaudeDshAdapter extends LlmAdapter {
     this.suspended.delete(sessionId);
     this.releaseTurn(claudeSessionId, turnId);
     this.runtime.rejectAllToolCalls?.(new Error("The DSH turn was abandoned before the tool result arrived"));
+    if (turnId) await this.runtime.interruptTurn(claudeSessionId, turnId).catch(() => {});
+  }
+
+  /**
+   * True when DSH has rewritten history that the linked Claude transcript already
+   * holds. A rewrite is a surface event that replaces an existing span, as compaction
+   * and tool-result pruning do. It counts when it is logged after the position the
+   * transcript was last sent up to, and its span starts at or before that position.
+   */
+  historyRewritten(sessionId, agent) {
+    const key = String(sessionId);
+    if (!this.links.has(key)) return false;
+    const log = sessionEventLog(agent.session);
+    const built = this.builtAt.get(key);
+    // A link saved before positions were recorded: nothing says what Claude holds,
+    // so any rewrite in the log counts.
+    if (built === undefined) return log.some(isReplaceEvent);
+    for (let index = log.length - 1; index >= 0 && log[index].seq > built; index -= 1) {
+      if (isReplaceEvent(log[index]) && log[index].surfaceOp.startSeq <= built) return true;
+    }
+    return false;
+  }
+
+  /** Record the DSH log position the Claude transcript now holds, and persist it. */
+  markBuilt(sessionId, agent) {
+    this.builtAt.set(String(sessionId), logHead(agent));
+    this.persistLink(sessionId);
+  }
+
+  /** Forget a Claude session whose transcript no longer matches DSH's history, and release it. */
+  async retireClaudeSession(sessionId) {
+    const key = String(sessionId);
+    const claudeSessionId = this.links.get(key) ?? null;
+    this.links.delete(key);
+    this.seen.delete(key);
+    this.builtAt.delete(key);
+    this.persistLink(key);
+    if (!claudeSessionId) return;
+    this.ownedSessions.delete(claudeSessionId);
+    this.readers.delete(claudeSessionId);
+    try {
+      await this.runtime.releaseSession?.(claudeSessionId);
+    } catch (error) {
+      this.logger?.warn?.(`Relay could not release Claude session ${claudeSessionId}: ${error?.message ?? error}`);
+    }
+  }
+
+  /**
+   * Release a parked turn whose transcript DSH has rewritten. Only this turn's parked
+   * calls are failed: rejectAllToolCalls would also fail parked calls of other DSH
+   * sessions sharing the runtime.
+   */
+  async releaseParkedTurn(sessionId, { claudeSessionId, turnId, calls }) {
+    this.suspended.delete(sessionId);
+    this.releaseTurn(claudeSessionId, turnId);
+    const error = new Error("DSH rewrote its history while the turn was waiting for a tool result");
+    for (const call of calls) this.runtime.rejectToolCall?.(call, error);
     if (turnId) await this.runtime.interruptTurn(claudeSessionId, turnId).catch(() => {});
   }
 
@@ -978,6 +1058,24 @@ function sessionEventLog(session) {
   const log = session?.log;
   if (Array.isArray(log)) return log;
   return [];
+}
+
+/** The newest DSH log position: what a Claude transcript holds once it has been sent. */
+function logHead(agent) {
+  const seq = sessionEventLog(agent.session).at(-1)?.seq;
+  return Number.isSafeInteger(seq) ? seq : -1;
+}
+
+/**
+ * A surface event that replaces an existing span of DSH history, as compaction and
+ * pruning do. System prompt rewrites are excluded: configure() already carries the
+ * system prompt to Claude on every turn.
+ */
+function isReplaceEvent(event) {
+  return event?.type !== "system/message"
+    && typeof event?.surfaceOp === "object"
+    && event.surfaceOp !== null
+    && Number.isSafeInteger(event.surfaceOp.startSeq);
 }
 
 function permissionConfiguration(events) {
