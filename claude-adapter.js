@@ -24,10 +24,18 @@ export class ClaudeDshAdapter extends LlmAdapter {
     // DSH sessions whose Claude turn is parked on tool calls DSH is executing.
     this.suspended = new Map();
     this.usageLedgers = new Map();
-    // Usage is recorded for the life of the turn, including the gap while a parked
-    // step waits for DSH to run its tools, so no report is lost to that gap.
+    // Claude sessions whose turns this adapter is running or has suspended. Only their
+    // usage is recorded, so an adapter sharing a runtime never keeps another's turns.
+    this.ownedSessions = new Set();
+    // Usage is recorded for the life of each owned turn, including the gap while a
+    // parked step waits for DSH to run its tools, so no report is lost to that gap.
+    this.usageUnsubscribe = null;
     if (runtime && (typeof runtime.subscribeActivity === "function" || typeof runtime.on === "function")) {
-      subscribeRuntimeActivity(runtime, message => this.recordUsageActivity(message));
+      try {
+        this.usageUnsubscribe = subscribeRuntimeActivity(runtime, message => this.recordUsageActivity(message));
+      } catch (error) {
+        this.logger?.warn?.(`Claude usage reporting is unavailable: ${error?.message ?? error}`);
+      }
     }
     for (const [sessionId, record] of linkStore?.entries() ?? []) {
       const claudeSessionId = record.claudeSessionId ?? record.sessionId ?? record.threadId;
@@ -35,6 +43,14 @@ export class ClaudeDshAdapter extends LlmAdapter {
       this.settings.set(sessionId, record.config);
       if (Number.isSafeInteger(record.seen)) this.seen.set(sessionId, record.seen);
     }
+  }
+
+  /** Stop recording usage from the runtime, and forget every ledger and owned session. */
+  dispose() {
+    this.usageUnsubscribe?.();
+    this.usageUnsubscribe = null;
+    this.usageLedgers.clear();
+    this.ownedSessions.clear();
   }
 
   providerInfo() {
@@ -264,6 +280,7 @@ export class ClaudeDshAdapter extends LlmAdapter {
     // would otherwise deliver the whole turn before anyone is listening.
     const stopActivity = subscribeRuntimeActivity(this.runtime, onActivity);
     let turnId = null;
+    this.ownedSessions.add(claudeSessionId);
     try {
       turnId = await start();
       debugLog("turn/started", { sessionId, claudeSessionId, turnId });
@@ -348,7 +365,10 @@ export class ClaudeDshAdapter extends LlmAdapter {
     } finally {
       stopActivity();
       queue.close();
-      if (turnId && !this.suspended.has(sessionId)) this.usageLedgers.delete(turnId);
+      if (!this.suspended.has(sessionId)) {
+        if (turnId) this.usageLedgers.delete(turnId);
+        this.ownedSessions.delete(claudeSessionId);
+      }
     }
   }
 
@@ -356,6 +376,7 @@ export class ClaudeDshAdapter extends LlmAdapter {
   async abandonTurn(sessionId, { claudeSessionId, turnId }) {
     this.suspended.delete(sessionId);
     if (turnId) this.usageLedgers.delete(turnId);
+    this.ownedSessions.delete(claudeSessionId);
     this.runtime.rejectAllToolCalls?.(new Error("The DSH turn was abandoned before the tool result arrived"));
     if (turnId) await this.runtime.interruptTurn(claudeSessionId, turnId).catch(() => {});
   }
@@ -386,6 +407,7 @@ export class ClaudeDshAdapter extends LlmAdapter {
     };
     const stopActivity = subscribeRuntimeActivity(this.runtime, onActivity);
     let turnId = null;
+    this.ownedSessions.add(claudeSessionId);
     try {
       const started = await this.runtime.sendMessage(claudeSessionId, {
         text,
@@ -423,6 +445,7 @@ export class ClaudeDshAdapter extends LlmAdapter {
       stopActivity();
       queue.close();
       if (turnId) this.usageLedgers.delete(turnId);
+      this.ownedSessions.delete(claudeSessionId);
       await this.runtime.releaseSession(claudeSessionId);
     }
   }
@@ -488,8 +511,8 @@ export class ClaudeDshAdapter extends LlmAdapter {
   /** Record one usage activity against its turn's ledger, whatever step is running. */
   recordUsageActivity(message) {
     if (!String(message?.method).startsWith("usage/")) return;
-    const turnId = message.params?.turnId;
-    if (!turnId) return;
+    const { sessionId, turnId } = message.params ?? {};
+    if (!turnId || !this.ownedSessions.has(sessionId)) return;
     recordUsage({ usage: this.usageLedgerFor(turnId) }, message);
   }
 

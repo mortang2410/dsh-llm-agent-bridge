@@ -60,6 +60,7 @@ export function createDshClaudePlugin(ctx, config = {}) {
         linkStore: new ClaudeLinkStore(resolveLinkPath(config.linkPath)), logger: ctx.logger,
       });
       defer(ctx.llm.registerAdapter([CLAUDE_PROVIDER], adapter));
+      defer(() => adapter.dispose());
       defer(runtime.subscribeRequest(request => {
         void handleClaudeSdkRequest(ctx, { adapter, runtime, request })
           .catch(error => ctx.logger.error(`Relay failed to handle a Claude interaction: ${error?.stack ?? error}`));

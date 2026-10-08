@@ -907,3 +907,31 @@ test("usage that lands while a tool runs is counted in the step that resumes", a
     delete process.env.DSH_AGENT_BRIDGE_USAGE_SETTLE_MS;
   }
 });
+
+test("usage from another adapter's turns on a shared runtime is not recorded here", async () => {
+  const runtime = new FakeRuntime();
+  const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve() });
+  runtime.emit("activity", notification("usage/apiCall", "someone-elses-session", "their-turn", {
+    callId: "their-call", usage: { input_tokens: 5 },
+  }));
+  assert.equal(adapter.usageLedgers.size, 0, "a session this adapter does not own leaves no ledger here");
+});
+
+test("usage that arrives after its turn has ended does not bring its ledger back", async () => {
+  const runtime = new FakeRuntime();
+  const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve() });
+  const agent = fakeAgent();
+  adapter.attachAgent(agent);
+  const chunks = await collect(adapter.stream({
+    provider: "claude",
+    model: "sonnet",
+    sessionId: agent.id,
+    messages: [{ role: "user", source: { kind: "user" }, content: [{ type: "text", text: "hi" }] }],
+  }));
+  assert.equal(chunks.at(-1).type, "finish");
+  assert.equal(adapter.usageLedgers.size, 0, "a finished turn leaves no ledger");
+
+  const { sessionId } = runtime.sent[0];
+  runtime.emit("activity", notification("usage/apiCall", sessionId, "turn-1", { callId: "late", usage: { input_tokens: 9 } }));
+  assert.equal(adapter.usageLedgers.size, 0, "a late report for a finished turn is not recorded");
+});
