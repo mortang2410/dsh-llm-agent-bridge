@@ -887,11 +887,21 @@ function takeStepUsage(state) {
     };
     reported.set(callId, { ...call });
     if (!Object.values(growth).some(value => value !== 0)) continue;
+    // DSH reads the prompt fields as the context size of one request, so they
+    // must come from a single call: the largest prompt among this step's calls.
+    // Summing them across calls inflated the context meter. Output still sums.
+    const prompt = {
+      inputTokens: call.input_tokens ?? 0,
+      cacheReadTokens: call.cache_read_input_tokens ?? 0,
+      cacheWriteTokens: call.cache_creation_input_tokens ?? 0,
+    };
+    const size = p => p.inputTokens + p.cacheReadTokens + p.cacheWriteTokens;
+    const keep = usage && size(usage) >= size(prompt) ? usage : prompt;
     usage = {
-      inputTokens: (usage?.inputTokens ?? 0) + growth.inputTokens,
+      inputTokens: keep.inputTokens,
       outputTokens: (usage?.outputTokens ?? 0) + growth.outputTokens,
-      cacheReadTokens: (usage?.cacheReadTokens ?? 0) + growth.cacheReadTokens,
-      cacheWriteTokens: (usage?.cacheWriteTokens ?? 0) + growth.cacheWriteTokens,
+      cacheReadTokens: keep.cacheReadTokens,
+      cacheWriteTokens: keep.cacheWriteTokens,
     };
   }
   return usage;
