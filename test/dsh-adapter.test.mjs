@@ -344,8 +344,11 @@ function fakeAgent({ tools = null } = {}) {
     ctx: tools ? { tools } : {},
     session: {
       header: { agentPreset: "standard", cwd: "/workspace/dsh" },
-      events: [],
-      append(type, data) { appended.push({ type, data }); },
+      // DSH's Session is event-sourced and its public log is `log`; there is no
+      // `events` field. A double that invents one hides a real adapter bug, so
+      // append() writes the same array the adapter reads.
+      log: [],
+      append(type, data) { appended.push({ type, data }); this.log.push({ type, data }); },
     },
   };
 }

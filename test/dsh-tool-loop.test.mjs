@@ -97,7 +97,7 @@ test("Claude's DSH tool call runs in the harness and the same parked query resum
   const fileText = (await readFile(filePath, "utf8")).trim();
   agent.session.append("tool-call", { id: call.block.id, name: call.block.name, arguments: call.block.arguments });
   agent.session.append("tool-result", { toolCallId: call.block.id, content: [{ type: "text", text: fileText }], isError: false });
-  const recorded = agent.session.events;
+  const recorded = agent.session.log;
   assert.equal(recorded.length, 2, "DSH's trajectory holds the call and its result");
   assert.equal(
     recorded[0].data.id, call.block.id,
@@ -230,13 +230,15 @@ async function activateBridge({ client, cwd }) {
 }
 
 function fakeAgent({ cwd }) {
-  const events = [];
   return {
     id: "dsh-session-1",
     session: {
       header: { agentPreset: "standard", cwd },
-      events,
-      append(type, data) { events.push({ type, data }); },
+      // DSH's Session is event-sourced: its public log is `log`, and there is no
+      // `events` field. Mirroring the real name is what keeps this test honest —
+      // a double that invents `events` would let the adapter's own bug through.
+      log: [],
+      append(type, data) { this.log.push({ type, data }); },
     },
   };
 }

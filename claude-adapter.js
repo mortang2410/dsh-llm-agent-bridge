@@ -222,7 +222,7 @@ export class ClaudeDshAdapter extends LlmAdapter {
     const instruction = latestUserIndex(options.messages);
     const text = instruction === -1 ? "" : messageText(options.messages[instruction]);
     if (!text) throw new Error("The Claude adapter received no user text");
-    const nativePermissions = permissionConfiguration(agent.session.events);
+    const nativePermissions = permissionConfiguration(sessionEventLog(agent.session));
     const config = this.configure(sessionId, {
       model: options.model,
       effort: options.reasoningEffort,
@@ -628,6 +628,23 @@ function completeTextItem(state, id, type, completeText) {
     chunks.push({ type: "block-end", index: block.index, block: { type, text: block.text } });
   }
   return chunks;
+}
+
+/**
+ * A session's event log, defensively.
+ *
+ * DSH's `Session` is an event-sourced object whose public log is `log`; there is
+ * no `events` accessor. Reading the wrong name yielded `undefined` and threw
+ * "events is not iterable" on the first turn, before anything reached the model.
+ *
+ * A missing or malformed log must not fail a turn: this only chooses the
+ * permission defaults the turn runs under, and every caller already passes an
+ * explicit sandbox and approval policy of its own.
+ */
+function sessionEventLog(session) {
+  const log = session?.log;
+  if (Array.isArray(log)) return log;
+  return [];
 }
 
 function permissionConfiguration(events) {
