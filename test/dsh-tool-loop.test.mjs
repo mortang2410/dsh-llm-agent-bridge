@@ -197,7 +197,15 @@ function fakeModelSdk({ toolName, args }) {
   };
 }
 
-/** Activate the real bridge through the real DSH plugin path and return its adapter. */
+/**
+ * Activate the real bridge through the real DSH plugin path and return its
+ * adapter.
+ *
+ * `linkPath` is pointed at a file inside the test's own temporary workspace. The
+ * default resolves under the operator's `~/.dsh/plugin-data`, and the adapter
+ * persists a link on the first turn — so without this, running the suite writes
+ * a fake session into the real installation's link store.
+ */
 async function activateBridge({ client, cwd }) {
   const { createDshClaudePlugin } = await import("../dsh-plugin.js");
   let adapter = null;
@@ -215,7 +223,7 @@ async function activateBridge({ client, cwd }) {
   const host = new PluginHost();
   await host.activate([
     createClaudeExecutionPlugin({ client, cwd }),
-    createDshClaudePlugin(ctx, { telemetry: "ignore" }),
+    createDshClaudePlugin(ctx, { telemetry: "ignore", linkPath: join(cwd, "agent-bridge-links.json") }),
   ]);
   assert.ok(adapter, "the DSH plugin path must register the Claude adapter");
   return { host, adapter, agent };

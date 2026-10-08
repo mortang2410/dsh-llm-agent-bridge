@@ -57,6 +57,30 @@ test("every service the plugin dereferences at runtime is declared in inject", a
   }
 });
 
+test("inject declares nothing the plugin does not use, because a spare name parks it", async () => {
+  const { inject } = await import("../host-plugin.js");
+  const sources = await Promise.all(["../claude-tools.js", "../dsh-plugin.js", "../claude-adapter.js"]
+    .map(file => readFile(new URL(file, import.meta.url), "utf8")));
+
+  const used = new Set();
+  for (const source of sources) {
+    for (const [, name] of source.matchAll(/\bctx\.([a-zA-Z][a-zA-Z0-9]*)\b/g)) used.add(name);
+  }
+  for (const method of ["on", "effect", "inject", "plugin", "logger"]) used.delete(method);
+
+  // Cordis treats every declared name as REQUIRED: the plugin stays inactive
+  // until all of them exist, so `apply()` never runs. A name this plugin never
+  // reads can therefore only stop it from loading — `webServer` did exactly
+  // that on any profile without a web bundle. `llm` is read as `ctx.llm` and is
+  // legitimately declared; `connection` is reached through the optional
+  // `ctx.inject([...])` seam and must NOT be in this list.
+  const spare = inject.filter(name => !used.has(name));
+  assert.deepEqual(
+    spare, [],
+    `inject declares ${spare.join(", ")}, which this plugin never reads; cordis would park the plugin until each one exists`,
+  );
+});
+
 test("the fallback client forwards every method the runtime calls on it", async () => {
   const { DELEGATED_CLIENT_METHODS } = await import("../plugin.mjs");
   const runtimeSource = await readFile(new URL("../session-runtime.mjs", import.meta.url), "utf8");
