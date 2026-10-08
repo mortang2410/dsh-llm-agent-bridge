@@ -322,6 +322,7 @@ export class ClaudeDshAdapter extends LlmAdapter {
       // Claude reports each model call as it runs, so a step's usage is the sum
       // of the calls it made. See stepUsageChunks for the turn-level fallback.
       for (const chunk of stepUsageChunks(state, completedTurn)) yield chunk;
+      if (completedTurn && turnId) this.usageLedgers.delete(turnId);
 
       if (batch) {
         const calls = batch.map(parked => ({
@@ -354,6 +355,7 @@ export class ClaudeDshAdapter extends LlmAdapter {
         yield { type: "finish", reason: { kind: "stop" }, replayState: { claudeSessionId, turnId } };
       }
     } catch (error) {
+      this.releaseTurn(claudeSessionId, turnId);
       debugLog("turn/error", { sessionId, turnId, aborted: Boolean(options.signal?.aborted), message: String(error?.message ?? error) });
       if (options.signal?.aborted) {
         if (turnId) await this.abandonTurn(sessionId, { claudeSessionId, turnId });
@@ -365,11 +367,16 @@ export class ClaudeDshAdapter extends LlmAdapter {
     } finally {
       stopActivity();
       queue.close();
-      if (!this.suspended.has(sessionId)) {
-        if (turnId) this.usageLedgers.delete(turnId);
-        this.ownedSessions.delete(claudeSessionId);
+      if (turnId && this.usageLedgers.get(turnId)?.completed && !this.suspended.has(sessionId)) {
+        this.usageLedgers.delete(turnId);
       }
     }
+  }
+
+  /** Forget a turn's ledger and its Claude session, once nothing more will report usage for them. */
+  releaseTurn(claudeSessionId, turnId) {
+    if (turnId) this.usageLedgers.delete(turnId);
+    this.ownedSessions.delete(claudeSessionId);
   }
 
   /** Release a Claude turn nobody is going to finish, and unpark its tool calls. */
@@ -510,9 +517,19 @@ export class ClaudeDshAdapter extends LlmAdapter {
 
   /** Record one usage activity against its turn's ledger, whatever step is running. */
   recordUsageActivity(message) {
+    const { sessionId } = message?.params ?? {};
+    if (!this.ownedSessions.has(sessionId)) return;
+    if (message.method === "turn/completed") {
+      // A completed turn reports no more usage. Its ledger stays until the step that
+      // completes the turn has read it; the session is released now.
+      const ledger = this.usageLedgers.get(message.params?.turn?.id);
+      if (ledger) ledger.completed = true;
+      this.ownedSessions.delete(sessionId);
+      return;
+    }
     if (!String(message?.method).startsWith("usage/")) return;
-    const { sessionId, turnId } = message.params ?? {};
-    if (!turnId || !this.ownedSessions.has(sessionId)) return;
+    const turnId = message.params?.turnId;
+    if (!turnId) return;
     recordUsage({ usage: this.usageLedgerFor(turnId) }, message);
   }
 
