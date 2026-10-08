@@ -254,8 +254,10 @@ console.log(JSON.stringify({ type: "result", result: "ok" }));
   const seen = JSON.parse(await readFile(envPath, "utf8"));
   assert.equal(seen.baseUrl, "http://127.0.0.1:8090/anthropic");
   assert.equal(seen.hasPath, true, "ordinary environment variables survive");
-  assert.equal(seen.apiKey, null, "no API key is invented");
-  assert.equal(seen.authToken, null, "no auth token is invented");
+  // Pass-through, not stripping: whatever the operator's environment held for
+  // these two reaches the child unchanged, and the bridge invents neither.
+  assert.equal(seen.apiKey, process.env.ANTHROPIC_API_KEY ?? null, "no API key is invented");
+  assert.equal(seen.authToken, process.env.ANTHROPIC_AUTH_TOKEN ?? null, "no auth token is invented");
   assert.equal(
     seen.nonessential, "1",
     "Claude Code's own title request carries its own effort, so a routed run must not emit it",
@@ -296,7 +298,14 @@ console.log(JSON.stringify({ type: "result", result: "ok" }));
   await completed;
 
   const seen = JSON.parse(await readFile(envPath, "utf8"));
-  assert.equal(seen.baseUrl, null, "an unconfigured bridge must not redirect Claude anywhere");
+  // Unconfigured means untouched, not blanked: the child inherits the parent's
+  // environment exactly, including a base URL the operator exported for their
+  // own reasons. What must not happen is the bridge adding its own routing.
+  assert.equal(seen.baseUrl, process.env.ANTHROPIC_BASE_URL ?? null, "the bridge adds no base URL of its own");
+  assert.equal(
+    seen.nonessential, process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC ?? null,
+    "the bridge adds the traffic flag only when it is routing through a gateway",
+  );
   await host.dispose();
 });
 

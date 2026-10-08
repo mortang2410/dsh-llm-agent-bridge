@@ -421,8 +421,13 @@ test("a configured gateway endpoint reaches every SDK query, keeping the rest of
   for (const options of captured) {
     assert.equal(options.env.ANTHROPIC_BASE_URL, "http://127.0.0.1:8090/anthropic");
     assert.equal(options.env.PATH, process.env.PATH, "ordinary environment variables survive");
-    assert.equal(options.env.ANTHROPIC_API_KEY, undefined, "no API key is invented");
-    assert.equal(options.env.ANTHROPIC_AUTH_TOKEN, undefined, "no auth token is invented");
+    // The contract is pass-through, not stripping: the bridge sets its own two
+    // variables and leaves every other one exactly as the parent had it. So a
+    // credential the operator deliberately exported survives, and none is
+    // invented where the operator had none. Comparing against the parent's
+    // value keeps this honest whether or not one is set on the test machine.
+    assert.equal(options.env.ANTHROPIC_API_KEY, process.env.ANTHROPIC_API_KEY, "no API key is invented");
+    assert.equal(options.env.ANTHROPIC_AUTH_TOKEN, process.env.ANTHROPIC_AUTH_TOKEN, "no auth token is invented");
   }
 });
 
@@ -436,4 +441,43 @@ test("an unconfigured client leaves the SDK's own environment default alone", as
   await client.sendMessage(session.id, { text: "hi" });
 
   assert.equal(captured.env, undefined, "the SDK default is not overridden with process.env");
+});
+
+test("the gateway environment is exactly the parent's plus the two routing variables", async () => {
+  // Hermetic: the parent environment here is fully controlled, so the assertion
+  // holds on any machine regardless of what the operator exported.
+  const saved = {};
+  const controlled = {
+    PATH: process.env.PATH,
+    HOME: process.env.HOME,
+    ANTHROPIC_API_KEY: "operator-supplied-key",
+    CLAUDE_CODE_OAUTH_TOKEN: "operator-supplied-oauth",
+  };
+  for (const key of Object.keys(controlled)) {
+    saved[key] = process.env[key];
+    process.env[key] = controlled[key];
+  }
+  try {
+    let captured = null;
+    const sdk = {
+      query(params) { captured = params.options; return Object.assign((async function* () {})(), { close() {}, interrupt: async () => {} }); },
+    };
+    const env = { ...process.env, ANTHROPIC_BASE_URL: "http://127.0.0.1:8090/anthropic_passthrough" };
+    const client = new ClaudeSdkClient({ sdk, env });
+    const session = await client.createSession({ sessionId: "s-passthrough" });
+    await client.sendMessage(session.id, { text: "hi" });
+
+    assert.equal(captured.env.ANTHROPIC_BASE_URL, "http://127.0.0.1:8090/anthropic_passthrough");
+    // The operator's own credential is passed through untouched, because that is
+    // the credential this whole path exists to preserve. The bridge reads it
+    // nowhere; it simply does not remove what the operator set.
+    assert.equal(captured.env.CLAUDE_CODE_OAUTH_TOKEN, "operator-supplied-oauth");
+    assert.equal(captured.env.ANTHROPIC_API_KEY, "operator-supplied-key");
+    assert.equal(captured.env.PATH, controlled.PATH);
+  } finally {
+    for (const key of Object.keys(saved)) {
+      if (saved[key] === undefined) delete process.env[key];
+      else process.env[key] = saved[key];
+    }
+  }
 });
