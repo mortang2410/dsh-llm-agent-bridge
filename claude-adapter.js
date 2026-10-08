@@ -25,7 +25,8 @@ export class ClaudeDshAdapter extends LlmAdapter {
     this.agents = new Map();
     this.seen = new Map();
     // The DSH log position (seq) that each Claude transcript was last sent up to. A rewrite of
-    // DSH history at or before that position means the transcript no longer matches DSH.
+    // DSH history that Claude holds (up to that position, or a reply it produced since) means
+    // the transcript no longer matches DSH.
     this.builtAt = new Map();
     // DSH sessions whose Claude turn is parked on tool calls DSH is executing.
     this.suspended = new Map();
@@ -426,8 +427,9 @@ export class ClaudeDshAdapter extends LlmAdapter {
   /**
    * True when DSH has rewritten history that the linked Claude transcript already
    * holds. A rewrite is a surface event that replaces an existing span, as compaction
-   * and tool-result pruning do. It counts when it is logged after the position the
-   * transcript was last sent up to, and its span starts at or before that position.
+   * and tool-result pruning do. Claude holds everything up to the position it was last
+   * sent, plus the replies it produced after that, so a rewrite counts when it is logged
+   * after the position and its span starts at or before the newest reply Claude holds.
    */
   historyRewritten(sessionId, agent) {
     const key = String(sessionId);
@@ -437,10 +439,10 @@ export class ClaudeDshAdapter extends LlmAdapter {
     // A link saved before positions were recorded: nothing says what Claude holds,
     // so any rewrite in the log counts.
     if (built === undefined) return log.some(isReplaceEvent);
-    for (let index = log.length - 1; index >= 0 && log[index].seq > built; index -= 1) {
-      if (isReplaceEvent(log[index]) && log[index].surfaceOp.startSeq <= built) return true;
-    }
-    return false;
+    const logged = [];
+    for (let index = log.length - 1; index >= 0 && log[index].seq > built; index -= 1) logged.push(log[index]);
+    const held = logged.reduce((seq, event) => (event.type === "assistant/message" ? Math.max(seq, event.seq) : seq), built);
+    return logged.some(event => isReplaceEvent(event) && event.surfaceOp.startSeq <= held);
   }
 
   /** Record the DSH log position the Claude transcript now holds, and persist it. */
