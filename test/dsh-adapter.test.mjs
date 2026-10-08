@@ -347,6 +347,16 @@ function checkpointMessage() {
   return { role: "user", source: { kind: "compaction" }, content: [{ type: "text", text: CHECKPOINT }] };
 }
 
+/** Event data for a reply the Claude route produced: DSH records the provider on the message source. */
+function claudeReply() {
+  return { message: { source: { kind: "model", provider: "claude" } } };
+}
+
+/** Event data for a reply some other model produced in the same DSH session. */
+function otherModelReply() {
+  return { message: { source: { kind: "model", provider: "openai" } } };
+}
+
 test("after DSH compacts history Claude already holds, the next request starts a new Claude session seeded from the compacted history", async () => {
   const runtime = new FakeRuntime();
   const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve() });
@@ -357,7 +367,7 @@ test("after DSH compacts history Claude already holds, the next request starts a
   await collect(adapter.stream({ provider: "claude", model: "sonnet", sessionId: agent.id, messages: [userMessage("first question")] }));
 
   // DSH records Claude's reply, then compacts the span it has seen into one checkpoint.
-  agent.session.append("assistant/message", {});
+  agent.session.append("assistant/message", claudeReply(), { surfaceOp: "append" });
   agent.session.append("compaction/summary", { shadowedSeqs: [1, 2] });
   agent.session.append("user/message", {}, { surfaceOp: { op: "replace", startSeq: 1, endSeq: 2 } });
 
@@ -384,7 +394,7 @@ test("a compaction that replaces only Claude's own last reply still starts a new
 
   // DSH logs the reply Claude has just given, then compacts only that reply. Claude holds the
   // reply, so the transcript no longer matches DSH even though the span starts after the last send.
-  agent.session.append("assistant/message", {}, { surfaceOp: "append" });
+  agent.session.append("assistant/message", claudeReply(), { surfaceOp: "append" });
   agent.session.append("compaction/summary", { shadowedSeqs: [2] });
   agent.session.append("user/message", {}, { surfaceOp: { op: "replace", startSeq: 2, endSeq: 2 } });
 
@@ -412,7 +422,7 @@ test("a compaction while a Claude turn waits on a tool result fails only that pa
   assert.ok(call, "the first request must park on a tool call");
 
   // DSH runs the tool, then compacts the span up to and including its result.
-  agent.session.append("assistant/message", {});
+  agent.session.append("assistant/message", claudeReply(), { surfaceOp: "append" });
   agent.session.append("tool/result", {});
   agent.session.append("compaction/summary", { shadowedSeqs: [1, 2, 3] });
   agent.session.append("user/message", {}, { surfaceOp: { op: "replace", startSeq: 1, endSeq: 3 } });
@@ -441,7 +451,7 @@ test("a plain follow-up keeps the Claude session, and rewriting only the system 
 
   agent.session.append("user/message", {});
   await collect(adapter.stream({ provider: "claude", model: "sonnet", sessionId: agent.id, messages: [userMessage("first question")] }));
-  agent.session.append("assistant/message", {}, { surfaceOp: "append" });
+  agent.session.append("assistant/message", claudeReply(), { surfaceOp: "append" });
   agent.session.append("system/message", {}, { surfaceOp: { op: "replace", startSeq: 1, endSeq: 1 } });
   agent.session.append("user/message", {}, { surfaceOp: "append" });
   await collect(adapter.stream({
@@ -451,6 +461,31 @@ test("a plain follow-up keeps the Claude session, and rewriting only the system 
 
   assert.equal(runtime.createdConfigs.length, 1, "no DSH history was compacted, so the transcript still matches");
   assert.deepEqual(runtime.released, []);
+});
+
+test("a compaction that replaces a reply from another model does not reset the Claude session", async () => {
+  const runtime = new FakeRuntime();
+  const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve() });
+  const agent = fakeAgent();
+  adapter.attachAgent(agent);
+
+  agent.session.append("user/message", {}, { surfaceOp: "append" });
+  await collect(adapter.stream({ provider: "claude", model: "sonnet", sessionId: agent.id, messages: [userMessage("first question")] }));
+
+  // Another model answers, DSH compacts only that answer, and Claude is selected again. Claude
+  // never held the answer, so its transcript still matches DSH and the checkpoint arrives as context.
+  agent.session.append("assistant/message", otherModelReply(), { surfaceOp: "append" });
+  agent.session.append("compaction/summary", { shadowedSeqs: [2] });
+  agent.session.append("user/message", {}, { surfaceOp: { op: "replace", startSeq: 2, endSeq: 2 } });
+
+  await collect(adapter.stream({
+    provider: "claude", model: "sonnet", sessionId: agent.id,
+    messages: [userMessage("first question"), checkpointMessage(), userMessage("second question")],
+  }));
+
+  assert.equal(runtime.createdConfigs.length, 1, "the rewritten answer was never in Claude's transcript");
+  assert.deepEqual(runtime.released, []);
+  assert.ok(runtime.sent[1].message.text.includes(CHECKPOINT), "the checkpoint still reaches Claude as context");
 });
 
 test("rewriting a message DSH has not yet sent to Claude does not reset the session", async () => {
@@ -464,7 +499,7 @@ test("rewriting a message DSH has not yet sent to Claude does not reset the sess
 
   // Claude replies, the user sends a message with an attachment, and DSH offloads that attachment
   // before the next request. Claude never held the attachment, so the transcript still matches.
-  agent.session.append("assistant/message", {}, { surfaceOp: "append" });
+  agent.session.append("assistant/message", claudeReply(), { surfaceOp: "append" });
   agent.session.append("user/message", {}, { surfaceOp: "append" });
   agent.session.append("user/message", {}, { surfaceOp: { op: "replace", startSeq: 3, endSeq: 3 } });
 
@@ -497,8 +532,8 @@ test("a rewrite Claude already built on does not reset the session again after a
     assert.equal(runtime.createdConfigs.length, 2);
 
     // The host restarts. Nothing has been rewritten since Claude was last sent a prompt.
-    agent.session.append("assistant/message", {});
-    agent.session.append("user/message", {});
+    agent.session.append("assistant/message", claudeReply(), { surfaceOp: "append" });
+    agent.session.append("user/message", {}, { surfaceOp: "append" });
     const after = new ClaudeDshAdapter({ runtime, ready: Promise.resolve(), linkStore: new ClaudeLinkStore(path) });
     after.attachAgent(agent);
     await collect(after.stream({

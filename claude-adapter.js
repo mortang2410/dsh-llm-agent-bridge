@@ -441,7 +441,7 @@ export class ClaudeDshAdapter extends LlmAdapter {
     if (built === undefined) return log.some(isReplaceEvent);
     const logged = [];
     for (let index = log.length - 1; index >= 0 && log[index].seq > built; index -= 1) logged.push(log[index]);
-    const held = logged.reduce((seq, event) => (event.type === "assistant/message" ? Math.max(seq, event.seq) : seq), built);
+    const held = logged.reduce((seq, event) => (producedByClaude(event) ? Math.max(seq, event.seq) : seq), built);
     return logged.some(event => isReplaceEvent(event) && event.surfaceOp.startSeq <= held);
   }
 
@@ -1066,6 +1066,11 @@ function sessionEventLog(session) {
 function logHead(agent) {
   const seq = sessionEventLog(agent.session).at(-1)?.seq;
   return Number.isSafeInteger(seq) ? seq : -1;
+}
+
+/** A reply the Claude route produced. DSH records the provider on the reply's message source. */
+function producedByClaude(event) {
+  return event.type === "assistant/message" && event.data?.message?.source?.provider === CLAUDE_PROVIDER;
 }
 
 /**
