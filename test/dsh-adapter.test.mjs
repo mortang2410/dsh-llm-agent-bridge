@@ -513,6 +513,8 @@ test("a resume that cannot start releases the turn's usage, and nothing is left 
     messages: [...messages, { role: "user", content: [{ type: "tool-result", toolCallId: call.block.id, content: [] }] }],
   })), /No Claude tool call is waiting/);
   assert.equal(adapter.usageLedgers.size, 0, "the failed resume released its turn's ledger, even though it never started");
+  assert.equal(adapter.ownedSessions.size, 0, "the failed resume gave up the session");
+  assert.equal(adapter.readers.size, 0, "no step is left reading the failed resume");
 });
 
 test("a result nothing is waiting for fails the turn rather than parking it", async () => {
