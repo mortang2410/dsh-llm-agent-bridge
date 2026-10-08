@@ -37,10 +37,13 @@ that adapter:
    own agent's calls.
 5. Projects Claude's reasoning and text into DSH's native stream chunk
    vocabulary, so the conversation renders like any other model's, and reports
-   the turn's token usage and the model's context window so DSH's own counters —
+   token usage and the model's context window so DSH's own counters —
    input, output, cache-hit rate, tokens/sec, context pressure — work for Claude
-   rows exactly as they do for its own. Usage arrives once per turn, on its last
-   step, since one Claude query spans every step of that turn. The plugin
+   rows exactly as they do for its own. Usage arrives once per DSH step: the sum of
+   the model calls that step made, each call's figures as the SDK reports them.
+   So context pressure is the prompt of the step's last call, and tokens/sec is
+   measured per step. Claude reports reasoning tokens only for the whole turn,
+   so that count rides on the turn's final step. The plugin
    contributes no client bundle and no renderer of its own: tool work is DSH's
    to display, from its own trajectory.
 

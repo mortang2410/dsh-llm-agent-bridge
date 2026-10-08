@@ -290,12 +290,13 @@ export class ClaudeDshAdapter extends LlmAdapter {
         for (const chunk of this.projectActivity(message, state)) yield chunk;
       }
 
+      if (batch) await this.settleStepUsage(queue, state);
       for (const chunk of closeOpenBlocks(state)) yield chunk;
 
-      // The protocol wants usage before the terminal finish. One Claude query
-      // spans every step of a turn, so its result - and this chunk - arrive
-      // once, on the last step, already totalled.
-      if (completedTurn?.usage) yield { type: "usage", usage: completedTurn.usage };
+      // The protocol wants usage before the terminal finish, once per DSH step.
+      // Claude reports each model call as it runs, so a step's usage is the sum
+      // of the calls it made. See stepUsageChunks for the turn-level fallback.
+      for (const chunk of stepUsageChunks(state, completedTurn)) yield chunk;
 
       if (batch) {
         const calls = batch.map(parked => ({
@@ -444,8 +445,35 @@ export class ClaudeDshAdapter extends LlmAdapter {
     ].join("\n");
   }
 
+  /**
+   * The SDK starts a tool as soon as its block closes, so a parked call can
+   * arrive before its model call has reported the final output count. Wait a
+   * moment for those figures, reading only usage activity, so the step reports
+   * them. Anything else is put back for the next consumer.
+   */
+  async settleStepUsage(queue, state) {
+    const deadline = Date.now() + STEP_USAGE_SETTLE_MS;
+    while (hasOpenCall(state) && Date.now() < deadline) {
+      const message = await queue.nextWithin(deadline - Date.now());
+      if (!message) return;
+      if (!String(message.method).startsWith("usage/")) {
+        queue.unshift(message);
+        return;
+      }
+      this.projectActivity(message, state);
+    }
+  }
+
   projectActivity(message, state) {
     const params = message.params ?? {};
+    if (message.method === "usage/apiCall") {
+      recordCallUsage(state, params.callId, params.usage);
+      return [];
+    }
+    if (message.method === "usage/apiCallEnded") {
+      state.endedCalls.add(params.callId);
+      return [];
+    }
     if (message.method === "item/reasoning/summaryTextDelta" || message.method === "item/reasoning/textDelta") {
       return textDelta(state, params.itemId, "reasoning", params.delta ?? "");
     }
@@ -503,6 +531,32 @@ class ActivityQueue {
         };
       }
     });
+  }
+
+  /** Like next(), but resolves null when nothing arrives within ms, leaving no waiter behind. */
+  nextWithin(ms) {
+    if (this.values.length) return Promise.resolve(this.values.shift());
+    if (this.closed) return Promise.reject(new Error(`${this.label} activity stream closed`));
+    return new Promise((resolve, reject) => {
+      const waiter = {
+        resolve: (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        reject,
+      };
+      const timer = setTimeout(() => {
+        const index = this.waiters.indexOf(waiter);
+        if (index >= 0) this.waiters.splice(index, 1);
+        resolve(null);
+      }, Math.max(0, ms));
+      this.waiters.push(waiter);
+    });
+  }
+
+  /** Put back a value that was read but belongs to a later consumer. */
+  unshift(value) {
+    if (!this.closed) this.values.unshift(value);
   }
 
   close() {
@@ -630,7 +684,66 @@ function createStreamState() {
     activityItems: new Map(),
     startedActivities: new Set(),
     completedActivities: new Set(),
+    calls: new Map(),
+    endedCalls: new Set(),
+    reportedCalls: new Set(),
   };
+}
+
+/** How long a parked step waits for its model calls to finish reporting usage. */
+const STEP_USAGE_SETTLE_MS = 2000;
+
+/** True while a model call of this step has not yet finished reporting usage. */
+function hasOpenCall(state) {
+  return [...state.calls.keys()].some(callId => !state.reportedCalls.has(callId) && !state.endedCalls.has(callId));
+}
+
+/** Record the largest figure seen for each usage field of one model call. */
+function recordCallUsage(state, callId, usage) {
+  if (!callId) return;
+  const call = state.calls.get(callId) ?? {};
+  for (const [field, value] of Object.entries(usage ?? {})) {
+    if (Number.isSafeInteger(value)) call[field] = Math.max(call[field] ?? 0, value);
+  }
+  state.calls.set(callId, call);
+}
+
+/** Sum the model calls that no earlier DSH step has reported, and mark them reported. */
+function takeStepUsage(state) {
+  let usage = null;
+  for (const [callId, call] of state.calls) {
+    if (state.reportedCalls.has(callId)) continue;
+    state.reportedCalls.add(callId);
+    usage = {
+      inputTokens: (usage?.inputTokens ?? 0) + (call.input_tokens ?? 0),
+      outputTokens: (usage?.outputTokens ?? 0) + (call.output_tokens ?? 0),
+      cacheReadTokens: (usage?.cacheReadTokens ?? 0) + (call.cache_read_input_tokens ?? 0),
+      cacheWriteTokens: (usage?.cacheWriteTokens ?? 0) + (call.cache_creation_input_tokens ?? 0),
+    };
+  }
+  return usage;
+}
+
+/**
+ * Usage chunks for the DSH step that just ended. A step that asks for tools
+ * reports the calls it made. The final step also carries the turn's reasoning
+ * count, which Claude reports only at turn level. A turn in which no call
+ * reported usage falls back to the turn's total.
+ */
+function* stepUsageChunks(state, completedTurn) {
+  if (!completedTurn) {
+    const usage = takeStepUsage(state);
+    if (usage) yield { type: "usage", usage };
+    return;
+  }
+  if (state.calls.size === 0) {
+    if (completedTurn.usage) yield { type: "usage", usage: completedTurn.usage };
+    return;
+  }
+  const usage = takeStepUsage(state);
+  if (!usage) return;
+  const reasoningTokens = completedTurn.usage?.reasoningTokens;
+  yield { type: "usage", usage: reasoningTokens === undefined ? usage : { ...usage, reasoningTokens } };
 }
 
 function textDelta(state, id, type, delta) {

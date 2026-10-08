@@ -554,7 +554,16 @@ function normalizeSdkMessage(message, state) {
     const event = message.event;
     if (event?.type === "message_start") {
       state.currentMessageId = event.message?.id ?? message.uuid ?? null;
+      events.push(...usageEvents(state.currentMessageId, event.message?.usage));
       return events;
+    }
+    // message_delta carries the call's running output count, so it is the
+    // figure the adapter needs for each model call's output tokens.
+    if (event?.type === "message_delta") {
+      events.push(...usageEvents(state.currentMessageId, event.usage));
+    }
+    if (event?.type === "message_stop" && state.currentMessageId) {
+      events.push({ method: "usage/apiCallEnded", params: { callId: state.currentMessageId } });
     }
     if (event?.type === "content_block_delta" && event.delta?.type === "text_delta") {
       const itemId = streamItemId(state, "text", event.index);
@@ -569,6 +578,7 @@ function normalizeSdkMessage(message, state) {
     return events;
   }
   if (message.type === "assistant") {
+    events.push(...usageEvents(message.message?.id, message.message?.usage));
     const content = message.message?.content ?? [];
     for (const [index, block] of content.entries()) {
       if (block.type === "text" && block.text) {
@@ -625,6 +635,25 @@ function normalizeSdkMessage(message, state) {
     });
   }
   return events;
+}
+
+const CALL_USAGE_FIELDS = ["input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"];
+
+/**
+ * One model call's usage as the SDK reports it. A call reports usage several
+ * times (at message start, in the output deltas, on each streamed assistant
+ * message), so each report is an activity and the adapter keeps the largest
+ * value of each field.
+ */
+function usageEvents(callId, usage) {
+  if (!callId || !usage) return [];
+  const fields = {};
+  for (const field of CALL_USAGE_FIELDS) {
+    if (Number.isSafeInteger(usage[field])) fields[field] = usage[field];
+  }
+  return Object.keys(fields).length > 0
+    ? [{ method: "usage/apiCall", params: { callId, usage: fields } }]
+    : [];
 }
 
 function streamItemId(state, type, index) {

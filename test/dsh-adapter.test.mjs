@@ -565,3 +565,91 @@ test("the harness is given token accounting and context capacity", async () => {
   const model = await adapter.resolveModel("claude", "sonnet");
   assert.deepEqual(model.context, { contextWindow: 200000 }, "context pressure cannot render without a window");
 });
+
+/**
+ * A two-step turn as the SDK reports it: the first model call asks for a tool,
+ * the second answers. Each call reports usage as it runs; the turn's total
+ * arrives last, and only it carries the reasoning count.
+ */
+class PerCallRuntime extends FakeRuntime {
+  async sendMessage(sessionId, message) {
+    this.sent.push({ sessionId, message });
+    const turnId = "turn-1";
+    queueMicrotask(() => {
+      this.emit("activity", notification("usage/apiCall", sessionId, turnId, { callId: "msg-a", usage: { input_tokens: 100 } }));
+      this.parked = { sessionId, turnId };
+      this.emit("activity", notification("tool/parked", sessionId, turnId, {
+        parkId: "park-1", name: message.dshTools[0].name, arguments: { command: "pwd" },
+      }));
+      // The SDK can park the tool before the model call reports its output.
+      setTimeout(() => {
+        this.emit("activity", notification("usage/apiCall", sessionId, turnId, { callId: "msg-a", usage: { output_tokens: 20 } }));
+        this.emit("activity", notification("usage/apiCallEnded", sessionId, turnId, { callId: "msg-a" }));
+      }, 20);
+    });
+    return { id: turnId, status: "inProgress", items: [] };
+  }
+
+  resolveToolCall(toolUseId, result) {
+    this.resolved.push({ toolUseId, result });
+    const parked = this.parked;
+    this.parked = null;
+    if (!parked) return false;
+    queueMicrotask(() => {
+      const { sessionId, turnId } = parked;
+      this.emit("activity", notification("usage/apiCall", sessionId, turnId, {
+        callId: "msg-b", usage: { input_tokens: 200, cache_read_input_tokens: 50, output_tokens: 30 },
+      }));
+      this.emit("activity", notification("usage/apiCallEnded", sessionId, turnId, { callId: "msg-b" }));
+      this.emit("activity", { method: "turn/completed", params: { sessionId, turn: {
+        id: turnId,
+        status: "completed",
+        error: null,
+        items: [],
+        usage: { inputTokens: 300, outputTokens: 50, cacheReadTokens: 50, cacheWriteTokens: 0, reasoningTokens: 40 },
+      } } });
+    });
+    return true;
+  }
+}
+
+test("each DSH step reports the usage of the model calls it made, and the steps add up to the turn", async () => {
+  const runtime = new PerCallRuntime();
+  const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve() });
+  const agent = fakeAgent();
+  adapter.attachAgent(agent);
+
+  const messages = [{ role: "user", source: { kind: "user" }, content: [{ type: "text", text: "go" }] }];
+  const request = {
+    provider: "claude",
+    model: "sonnet",
+    sessionId: agent.id,
+    messages,
+    tools: [{ name: "bash", description: "run", parameters: { type: "object", properties: {} } }],
+  };
+  const first = await collect(adapter.stream(request));
+  const call = first.find(chunk => chunk.type === "block-end" && chunk.block.type === "tool-call");
+  const second = await collect(adapter.stream({
+    ...request,
+    messages: [...messages, { role: "user", content: [{ type: "tool-result", toolCallId: call.block.id, content: [{ type: "text", text: "/workspace" }] }] }],
+  }));
+
+  const firstUsage = first.filter(chunk => chunk.type === "usage").map(chunk => chunk.usage);
+  const secondUsage = second.filter(chunk => chunk.type === "usage").map(chunk => chunk.usage);
+  assert.deepEqual(firstUsage, [{ inputTokens: 100, outputTokens: 20, cacheReadTokens: 0, cacheWriteTokens: 0 }],
+    "the tool-calling step reports its own call, not the turn");
+  assert.deepEqual(secondUsage, [{ inputTokens: 200, outputTokens: 30, cacheReadTokens: 50, cacheWriteTokens: 0, reasoningTokens: 40 }],
+    "the final step reports its own call and the turn's reasoning count");
+  assert.equal(first.at(-1).type, "finish");
+  assert.equal(second.at(-1).type, "finish");
+  assert.ok(first.findIndex(chunk => chunk.type === "usage") < first.length - 1, "usage precedes the terminal finish");
+
+  // No call is dropped or counted twice: the steps sum to the turn's own total.
+  const sum = [...firstUsage, ...secondUsage].reduce((total, usage) => ({
+    inputTokens: total.inputTokens + usage.inputTokens,
+    outputTokens: total.outputTokens + usage.outputTokens,
+    cacheReadTokens: total.cacheReadTokens + usage.cacheReadTokens,
+    cacheWriteTokens: total.cacheWriteTokens + usage.cacheWriteTokens,
+  }), { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 });
+  assert.deepEqual(sum, { inputTokens: 300, outputTokens: 50, cacheReadTokens: 50, cacheWriteTokens: 0 });
+});

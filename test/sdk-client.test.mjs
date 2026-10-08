@@ -228,6 +228,45 @@ test("Claude SDK client interrupts and aborts an in-progress query", async () =>
   assert.equal(queryParams.options.abortController.signal.aborted, true);
 });
 
+test("each model call's usage reaches the harness as the SDK reports it", async () => {
+  const sdk = {
+    query(params) {
+      return queryObject(async function* () {
+        yield { type: "stream_event", session_id: params.options.sessionId, uuid: "c1", parent_tool_use_id: null, event: {
+          type: "message_start",
+          message: { id: "msg-usage", usage: { input_tokens: 100, cache_read_input_tokens: 0, cache_creation_input_tokens: 40, output_tokens: 1 } },
+        } };
+        yield { type: "stream_event", session_id: params.options.sessionId, uuid: "c2", parent_tool_use_id: null, event: {
+          type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 20 },
+        } };
+        yield { type: "assistant", session_id: params.options.sessionId, uuid: "c3", parent_tool_use_id: null, message: {
+          id: "msg-usage", role: "assistant", model: "sonnet", stop_reason: "end_turn", stop_sequence: null,
+          usage: { input_tokens: 100, cache_read_input_tokens: 0, cache_creation_input_tokens: 40, output_tokens: 20 },
+          content: [{ type: "text", text: "done" }],
+        } };
+        yield { type: "stream_event", session_id: params.options.sessionId, uuid: "c5", parent_tool_use_id: null, event: { type: "message_stop" } };
+        yield { type: "result", session_id: params.options.sessionId, uuid: "c4", subtype: "success", is_error: false, result: "done", usage: {} };
+      });
+    },
+  };
+  const client = new ClaudeSdkClient({ sdk });
+  await client.start();
+  const session = await client.createSession({ sessionId: "22222222-2222-4222-8222-222222222222", cwd: "/workspace/usage" });
+  const activity = [];
+  client.on("activity", message => activity.push(message));
+  await client.sendMessage(session.id, { text: "hi", model: "sonnet", effort: "low" });
+  await untilTurnCompleted(activity);
+
+  const reports = activity.filter(message => message.method === "usage/apiCall").map(message => message.params);
+  assert.equal(reports.length, 3, "message start, the output delta and the streamed assistant message each report the call");
+  assert.ok(activity.some(message => message.method === "usage/apiCallEnded" && message.params.callId === "msg-usage"),
+    "the call's end is reported, so a parked step knows when its figures are final");
+  assert.ok(reports.every(report => report.callId === "msg-usage"), "every report names the model call it belongs to");
+  assert.deepEqual(reports[0].usage, { input_tokens: 100, cache_read_input_tokens: 0, cache_creation_input_tokens: 40, output_tokens: 1 });
+  assert.deepEqual(reports[1].usage, { output_tokens: 20 });
+  assert.deepEqual(reports[2].usage, { input_tokens: 100, cache_read_input_tokens: 0, cache_creation_input_tokens: 40, output_tokens: 20 });
+});
+
 function queryObject(factory) {
   const iterator = factory();
   return {
