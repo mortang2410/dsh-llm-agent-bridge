@@ -23,6 +23,7 @@ export class ClaudeDshAdapter extends LlmAdapter {
     this.seen = new Map();
     // DSH sessions whose Claude turn is parked on tool calls DSH is executing.
     this.suspended = new Map();
+    this.usageLedgers = new Map();
     for (const [sessionId, record] of linkStore?.entries() ?? []) {
       const claudeSessionId = record.claudeSessionId ?? record.sessionId ?? record.threadId;
       if (claudeSessionId) this.links.set(sessionId, claudeSessionId);
@@ -261,7 +262,7 @@ export class ClaudeDshAdapter extends LlmAdapter {
     try {
       turnId = await start();
       debugLog("turn/started", { sessionId, claudeSessionId, turnId });
-      const state = createStreamState();
+      const state = createStreamState(this.usageLedgerFor(turnId));
       let completedTurn = null;
       let batch = null;
       let first = true;
@@ -290,7 +291,9 @@ export class ClaudeDshAdapter extends LlmAdapter {
         for (const chunk of this.projectActivity(message, state)) yield chunk;
       }
 
-      if (batch) await this.settleStepUsage(queue, state);
+      if (batch) {
+        for await (const chunk of this.settleParkedStep(queue, state, batch, turnId)) yield chunk;
+      }
       for (const chunk of closeOpenBlocks(state)) yield chunk;
 
       // The protocol wants usage before the terminal finish, once per DSH step.
@@ -340,6 +343,7 @@ export class ClaudeDshAdapter extends LlmAdapter {
     } finally {
       stopActivity();
       queue.close();
+      if (turnId && !this.suspended.has(sessionId)) this.usageLedgers.delete(turnId);
     }
   }
 
@@ -448,20 +452,42 @@ export class ClaudeDshAdapter extends LlmAdapter {
   /**
    * The SDK starts a tool as soon as its block closes, so a parked call can
    * arrive before its model call has reported the final output count. Wait a
-   * moment for those figures, reading only usage activity, so the step reports
-   * them. Anything else is put back for the next consumer.
+   * moment, bounded by the settle limit, for this step's calls to finish. While
+   * waiting, the stream keeps moving: usage is recorded, another parked call
+   * joins the batch, and text is passed on.
    */
-  async settleStepUsage(queue, state) {
-    const deadline = Date.now() + STEP_USAGE_SETTLE_MS;
+  async *settleParkedStep(queue, state, batch, turnId) {
+    const deadline = Date.now() + usageSettleMs();
     while (hasOpenCall(state) && Date.now() < deadline) {
       const message = await queue.nextWithin(deadline - Date.now());
-      if (!message) return;
-      if (!String(message.method).startsWith("usage/")) {
-        queue.unshift(message);
-        return;
+      if (!message) break;
+      if (message.params?.turnId && message.params.turnId !== turnId) continue;
+      if (String(message.method).startsWith("usage/")) {
+        this.projectActivity(message, state);
+        continue;
       }
-      this.projectActivity(message, state);
+      if (isToolParked(message)) {
+        batch.push(message.params);
+        continue;
+      }
+      if (message.method === "turn/completed") {
+        // A parked turn cannot complete before its tool results arrive.
+        queue.unshift(message);
+        break;
+      }
+      for (const chunk of this.projectActivity(message, state)) yield chunk;
     }
+    batch.push(...drainParkedToolCalls(queue, turnId));
+  }
+
+  /** The turn's usage ledger, which outlives each step while the turn is parked. */
+  usageLedgerFor(turnId) {
+    let ledger = this.usageLedgers.get(turnId);
+    if (!ledger) {
+      ledger = newUsageLedger();
+      this.usageLedgers.set(turnId, ledger);
+    }
+    return ledger;
   }
 
   projectActivity(message, state) {
@@ -471,7 +497,7 @@ export class ClaudeDshAdapter extends LlmAdapter {
       return [];
     }
     if (message.method === "usage/apiCallEnded") {
-      state.endedCalls.add(params.callId);
+      state.usage.ended.add(params.callId);
       return [];
     }
     if (message.method === "item/reasoning/summaryTextDelta" || message.method === "item/reasoning/textDelta") {
@@ -533,23 +559,40 @@ class ActivityQueue {
     });
   }
 
-  /** Like next(), but resolves null when nothing arrives within ms, leaving no waiter behind. */
+  /**
+   * Like next(), but resolves null when nothing arrives within ms, and rejects at
+   * once if the turn is aborted. Every exit path detaches the waiter, so a value
+   * that arrives later is never handed to a reader that has already left.
+   */
   nextWithin(ms) {
     if (this.values.length) return Promise.resolve(this.values.shift());
     if (this.closed) return Promise.reject(new Error(`${this.label} activity stream closed`));
+    if (this.signal?.aborted) return Promise.reject(this.signal.reason ?? new Error("aborted"));
     return new Promise((resolve, reject) => {
-      const waiter = {
-        resolve: (value) => {
-          clearTimeout(timer);
-          resolve(value);
-        },
-        reject,
-      };
-      const timer = setTimeout(() => {
+      const waiter = { resolve: null, reject: null };
+      const detach = () => {
+        clearTimeout(timer);
+        this.signal?.removeEventListener("abort", onAbort);
         const index = this.waiters.indexOf(waiter);
         if (index >= 0) this.waiters.splice(index, 1);
+      };
+      const onAbort = () => {
+        detach();
+        reject(this.signal.reason ?? new Error("aborted"));
+      };
+      const timer = setTimeout(() => {
+        detach();
         resolve(null);
       }, Math.max(0, ms));
+      waiter.resolve = (value) => {
+        detach();
+        resolve(value);
+      };
+      waiter.reject = (error) => {
+        detach();
+        reject(error);
+      };
+      this.signal?.addEventListener("abort", onAbort, { once: true });
       this.waiters.push(waiter);
     });
   }
@@ -676,7 +719,7 @@ function closeOpenBlocks(state) {
   return chunks;
 }
 
-function createStreamState() {
+function createStreamState(usage = newUsageLedger()) {
   return {
     nextIndex: 0,
     blocks: new Map(),
@@ -684,63 +727,88 @@ function createStreamState() {
     activityItems: new Map(),
     startedActivities: new Set(),
     completedActivities: new Set(),
-    calls: new Map(),
-    endedCalls: new Set(),
-    reportedCalls: new Set(),
+    /** The turn's usage ledger, shared by every DSH step of the turn. */
+    usage,
+    /** Calls an earlier step of this turn already started; this step does not wait for them. */
+    preexisting: new Set(usage.calls.keys()),
   };
+}
+
+/** Usage bookkeeping for one Claude turn. */
+function newUsageLedger() {
+  return { calls: new Map(), reported: new Map(), ended: new Set() };
 }
 
 /** How long a parked step waits for its model calls to finish reporting usage. */
 const STEP_USAGE_SETTLE_MS = 2000;
 
-/** True while a model call of this step has not yet finished reporting usage. */
+/** The settle limit, overridable for tests with DSH_AGENT_BRIDGE_USAGE_SETTLE_MS. */
+function usageSettleMs() {
+  const raw = process.env.DSH_AGENT_BRIDGE_USAGE_SETTLE_MS;
+  const ms = raw === undefined ? Number.NaN : Number(raw);
+  return Number.isFinite(ms) && ms >= 0 ? ms : STEP_USAGE_SETTLE_MS;
+}
+
+/** True while a model call this step started has not finished reporting usage. */
 function hasOpenCall(state) {
-  return [...state.calls.keys()].some(callId => !state.reportedCalls.has(callId) && !state.endedCalls.has(callId));
+  return [...state.usage.calls.keys()].some(callId => !state.preexisting.has(callId) && !state.usage.ended.has(callId));
 }
 
 /** Record the largest figure seen for each usage field of one model call. */
 function recordCallUsage(state, callId, usage) {
   if (!callId) return;
-  const call = state.calls.get(callId) ?? {};
+  const call = state.usage.calls.get(callId) ?? {};
   for (const [field, value] of Object.entries(usage ?? {})) {
     if (Number.isSafeInteger(value)) call[field] = Math.max(call[field] ?? 0, value);
   }
-  state.calls.set(callId, call);
+  state.usage.calls.set(callId, call);
 }
 
-/** Sum the model calls that no earlier DSH step has reported, and mark them reported. */
+/**
+ * The usage that arrived since the last step reported, over every model call of
+ * the turn. A call's figures are cumulative, so a step reports only the growth
+ * since its previous report. A figure that arrives late is counted exactly once,
+ * in the step that receives it.
+ */
 function takeStepUsage(state) {
+  const { calls, reported } = state.usage;
   let usage = null;
-  for (const [callId, call] of state.calls) {
-    if (state.reportedCalls.has(callId)) continue;
-    state.reportedCalls.add(callId);
+  for (const [callId, call] of calls) {
+    const before = reported.get(callId) ?? {};
+    const growth = {
+      inputTokens: (call.input_tokens ?? 0) - (before.input_tokens ?? 0),
+      outputTokens: (call.output_tokens ?? 0) - (before.output_tokens ?? 0),
+      cacheReadTokens: (call.cache_read_input_tokens ?? 0) - (before.cache_read_input_tokens ?? 0),
+      cacheWriteTokens: (call.cache_creation_input_tokens ?? 0) - (before.cache_creation_input_tokens ?? 0),
+    };
+    reported.set(callId, { ...call });
+    if (!Object.values(growth).some(value => value !== 0)) continue;
     usage = {
-      inputTokens: (usage?.inputTokens ?? 0) + (call.input_tokens ?? 0),
-      outputTokens: (usage?.outputTokens ?? 0) + (call.output_tokens ?? 0),
-      cacheReadTokens: (usage?.cacheReadTokens ?? 0) + (call.cache_read_input_tokens ?? 0),
-      cacheWriteTokens: (usage?.cacheWriteTokens ?? 0) + (call.cache_creation_input_tokens ?? 0),
+      inputTokens: (usage?.inputTokens ?? 0) + growth.inputTokens,
+      outputTokens: (usage?.outputTokens ?? 0) + growth.outputTokens,
+      cacheReadTokens: (usage?.cacheReadTokens ?? 0) + growth.cacheReadTokens,
+      cacheWriteTokens: (usage?.cacheWriteTokens ?? 0) + growth.cacheWriteTokens,
     };
   }
   return usage;
 }
 
 /**
- * Usage chunks for the DSH step that just ended. A step that asks for tools
- * reports the calls it made. The final step also carries the turn's reasoning
- * count, which Claude reports only at turn level. A turn in which no call
- * reported usage falls back to the turn's total.
+ * Usage chunks for the DSH step that just ended. Each DSH step is one model call,
+ * since the adapter parks at every tool request. The final step also carries the
+ * turn's reasoning count, which Claude reports only at turn level. A turn in which
+ * no call reported usage falls back to the turn's own total.
  */
 function* stepUsageChunks(state, completedTurn) {
+  const usage = takeStepUsage(state);
   if (!completedTurn) {
-    const usage = takeStepUsage(state);
     if (usage) yield { type: "usage", usage };
     return;
   }
-  if (state.calls.size === 0) {
+  if (state.usage.calls.size === 0) {
     if (completedTurn.usage) yield { type: "usage", usage: completedTurn.usage };
     return;
   }
-  const usage = takeStepUsage(state);
   if (!usage) return;
   const reasoningTokens = completedTurn.usage?.reasoningTokens;
   yield { type: "usage", usage: reasoningTokens === undefined ? usage : { ...usage, reasoningTokens } };

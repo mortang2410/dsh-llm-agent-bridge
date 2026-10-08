@@ -653,3 +653,148 @@ test("each DSH step reports the usage of the model calls it made, and the steps 
   }), { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 });
   assert.deepEqual(sum, { inputTokens: 300, outputTokens: 50, cacheReadTokens: 50, cacheWriteTokens: 0 });
 });
+
+/** A call whose output finishes only after its step has reported, as a late report would. */
+class LateReportRuntime extends FakeRuntime {
+  async sendMessage(sessionId, message) {
+    this.sent.push({ sessionId, message });
+    const turnId = "turn-1";
+    queueMicrotask(() => {
+      this.emit("activity", notification("usage/apiCall", sessionId, turnId, { callId: "msg-a", usage: { input_tokens: 100, output_tokens: 1 } }));
+      this.parked = { sessionId, turnId };
+      this.emit("activity", notification("tool/parked", sessionId, turnId, {
+        parkId: "park-1", name: message.dshTools[0].name, arguments: { command: "pwd" },
+      }));
+    });
+    return { id: turnId, status: "inProgress", items: [] };
+  }
+
+  resolveToolCall(toolUseId, result) {
+    this.resolved.push({ toolUseId, result });
+    const parked = this.parked;
+    this.parked = null;
+    if (!parked) return false;
+    queueMicrotask(() => {
+      const { sessionId, turnId } = parked;
+      this.emit("activity", notification("usage/apiCall", sessionId, turnId, { callId: "msg-a", usage: { output_tokens: 20 } }));
+      this.emit("activity", notification("usage/apiCallEnded", sessionId, turnId, { callId: "msg-a" }));
+      this.emit("activity", notification("usage/apiCall", sessionId, turnId, { callId: "msg-b", usage: { input_tokens: 200, output_tokens: 30 } }));
+      this.emit("activity", notification("usage/apiCallEnded", sessionId, turnId, { callId: "msg-b" }));
+      this.emit("activity", { method: "turn/completed", params: { sessionId, turn: {
+        id: turnId,
+        status: "completed",
+        error: null,
+        items: [],
+        usage: { inputTokens: 300, outputTokens: 50, cacheReadTokens: 0, cacheWriteTokens: 0 },
+      } } });
+    });
+    return true;
+  }
+}
+
+/** Two tool calls in one assistant message, where the second park arrives during the usage wait. */
+class ParallelParkRuntime extends FakeRuntime {
+  async sendMessage(sessionId, message) {
+    this.sent.push({ sessionId, message });
+    const turnId = "turn-1";
+    queueMicrotask(() => {
+      this.emit("activity", notification("usage/apiCall", sessionId, turnId, { callId: "msg-a", usage: { input_tokens: 100 } }));
+      this.parked = { sessionId, turnId };
+      this.emit("activity", notification("tool/parked", sessionId, turnId, {
+        parkId: "park-1", name: message.dshTools[0].name, arguments: { command: "pwd" },
+      }));
+      setTimeout(() => {
+        this.emit("activity", notification("tool/parked", sessionId, turnId, {
+          parkId: "park-2", name: message.dshTools[0].name, arguments: { command: "date" },
+        }));
+        this.emit("activity", notification("usage/apiCall", sessionId, turnId, { callId: "msg-a", usage: { output_tokens: 20 } }));
+        this.emit("activity", notification("usage/apiCallEnded", sessionId, turnId, { callId: "msg-a" }));
+      }, 10);
+    });
+    return { id: turnId, status: "inProgress", items: [] };
+  }
+}
+
+/** A call that never reports its end, so the only thing that can stop the wait is the abort. */
+class SilentCallRuntime extends FakeRuntime {
+  async sendMessage(sessionId, message) {
+    this.sent.push({ sessionId, message });
+    const turnId = "turn-1";
+    queueMicrotask(() => {
+      this.emit("activity", notification("usage/apiCall", sessionId, turnId, { callId: "msg-a", usage: { input_tokens: 100 } }));
+      this.parked = { sessionId, turnId };
+      this.emit("activity", notification("tool/parked", sessionId, turnId, {
+        parkId: "park-1", name: message.dshTools[0].name, arguments: { command: "pwd" },
+      }));
+    });
+    return { id: turnId, status: "inProgress", items: [] };
+  }
+}
+
+const bashTool = [{ name: "bash", description: "run", parameters: { type: "object", properties: {} } }];
+
+test("a late usage report is counted once, in the step that receives it", async () => {
+  process.env.DSH_AGENT_BRIDGE_USAGE_SETTLE_MS = "30";
+  try {
+    const runtime = new LateReportRuntime();
+    const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve() });
+    const agent = fakeAgent();
+    adapter.attachAgent(agent);
+    const messages = [{ role: "user", source: { kind: "user" }, content: [{ type: "text", text: "go" }] }];
+    const request = { provider: "claude", model: "sonnet", sessionId: agent.id, messages, tools: bashTool };
+    const first = await collect(adapter.stream(request));
+    const call = first.find(chunk => chunk.type === "block-end" && chunk.block.type === "tool-call");
+    const second = await collect(adapter.stream({
+      ...request,
+      messages: [...messages, { role: "user", content: [{ type: "tool-result", toolCallId: call.block.id, content: [{ type: "text", text: "/workspace" }] }] }],
+    }));
+
+    const firstUsage = first.filter(chunk => chunk.type === "usage").map(chunk => chunk.usage);
+    const secondUsage = second.filter(chunk => chunk.type === "usage").map(chunk => chunk.usage);
+    assert.deepEqual(firstUsage, [{ inputTokens: 100, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 }],
+      "the step reports what had arrived when its wait ended");
+    assert.deepEqual(secondUsage, [{ inputTokens: 200, outputTokens: 49, cacheReadTokens: 0, cacheWriteTokens: 0 }],
+      "the late 19 output tokens arrive in step two, and the first call's input is not counted again");
+    const total = [...firstUsage, ...secondUsage].reduce((sum, usage) => sum + usage.inputTokens, 0);
+    assert.equal(total, 300, "the input across steps is the turn's input, counted once");
+  } finally {
+    delete process.env.DSH_AGENT_BRIDGE_USAGE_SETTLE_MS;
+  }
+});
+
+test("tool calls parked while a step waits for its usage are all run", async () => {
+  const runtime = new ParallelParkRuntime();
+  const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve() });
+  const agent = fakeAgent();
+  adapter.attachAgent(agent);
+  const first = await collect(adapter.stream({
+    provider: "claude",
+    model: "sonnet",
+    sessionId: agent.id,
+    messages: [{ role: "user", source: { kind: "user" }, content: [{ type: "text", text: "go" }] }],
+    tools: bashTool,
+  }));
+  const calls = first.filter(chunk => chunk.type === "block-end" && chunk.block.type === "tool-call").map(chunk => chunk.block.id);
+  assert.equal(calls.length, 2, "a second park that arrives during the usage wait joins the same step, instead of being dropped");
+  assert.equal(first.at(-1).reason.kind, "tool-calls");
+});
+
+test("aborting a step while its usage is pending ends the turn at once", async () => {
+  const runtime = new SilentCallRuntime();
+  const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve() });
+  const agent = fakeAgent();
+  adapter.attachAgent(agent);
+  const controller = new AbortController();
+  setTimeout(() => controller.abort(), 50);
+  const started = Date.now();
+  const chunks = await collect(adapter.stream({
+    provider: "claude",
+    model: "sonnet",
+    sessionId: agent.id,
+    signal: controller.signal,
+    messages: [{ role: "user", source: { kind: "user" }, content: [{ type: "text", text: "go" }] }],
+    tools: bashTool,
+  }));
+  assert.ok(Date.now() - started < 1000, "the usage wait does not hold an aborted turn for its full limit");
+  assert.equal(chunks.at(-1).reason.kind, "aborted");
+});
