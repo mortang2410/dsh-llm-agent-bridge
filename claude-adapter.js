@@ -534,13 +534,51 @@ function drainParkedToolCalls(queue, turnId) {
   return parked;
 }
 
+/**
+ * Where a harness tool result lives, across the two shapes DSH has shipped.
+ *
+ * DSH 0.1.x (`createToolResultMessage` in dsh-llm 0.1.5-rc.2) returns a `user`
+ * message whose content holds one block of type `tool-result`, carrying the id on
+ * the block. DSH 0.2.x returns a `tool` message that carries `toolCallId` on the
+ * MESSAGE and has no `tool-result` block at all — its content is the plain result
+ * content.
+ *
+ * Only the 0.2.x shape is real on the host this plugin now runs against, and
+ * reading for 0.1.x alone silently found nothing: the parked call was never
+ * resolved, the turn was abandoned, and the model was handed the SDK's canned
+ * "the tool use was rejected" text while DSH had in fact executed the tool.
+ *
+ * @returns every result in `message`, as `{ toolCallId, content, isError }`.
+ */
+function toolResultsIn(message) {
+  if (!message) return [];
+  const results = [];
+  // 0.2.x: the id is on the message.
+  if (typeof message.toolCallId === "string") {
+    results.push({
+      toolCallId: message.toolCallId,
+      content: message.content ?? [],
+      isError: Boolean(message.isError),
+    });
+    return results;
+  }
+  // 0.1.x: the id is on a `tool-result` content block.
+  for (const block of message.content ?? []) {
+    if (block?.type !== "tool-result" || typeof block.toolCallId !== "string") continue;
+    results.push({
+      toolCallId: block.toolCallId,
+      content: block.content ?? [],
+      isError: Boolean(block.isError),
+    });
+  }
+  return results;
+}
+
 /** Every tool-result id present, for tracing a mismatch against what was parked. */
 function allToolResultIds(messages) {
   const ids = [];
   for (const message of messages ?? []) {
-    for (const block of message?.content ?? []) {
-      if (block?.type === "tool-result") ids.push(block.toolCallId);
-    }
+    for (const result of toolResultsIn(message)) ids.push(result.toolCallId);
   }
   return ids;
 }
@@ -550,9 +588,9 @@ function toolResultsFor(messages, callIds) {
   const wanted = new Set(callIds);
   const results = [];
   for (const message of messages ?? []) {
-    for (const block of message?.content ?? []) {
-      if (block?.type !== "tool-result" || !wanted.has(block.toolCallId)) continue;
-      results.push({ toolCallId: block.toolCallId, content: block.content ?? [], isError: Boolean(block.isError) });
+    for (const result of toolResultsIn(message)) {
+      if (!wanted.has(result.toolCallId)) continue;
+      results.push(result);
     }
   }
   return results;
@@ -705,22 +743,44 @@ function latestUserIndex(messages) {
  * by another model is mostly tool calls and their results — carrying only the
  * prose would hand Claude a summary of work it cannot see. Results are bounded:
  * this is context, not a transcript.
+ *
+ * Results go through {@link toolResultsIn} so both DSH shapes are covered. On
+ * 0.2.x the whole message IS the result, so a message-shaped result is rendered
+ * before its own (plain) content, which is not a `tool-result` block.
  */
 function seedText(message) {
   const parts = [];
+  const results = toolResultsIn(message);
+  // A 0.2.x result message carries the result instead of ordinary content, so
+  // render it here and skip the block loop below rather than printing its
+  // content twice.
+  if (typeof message?.toolCallId === "string") {
+    for (const result of results) {
+      const text = resultText(result);
+      if (text) parts.push(`${result.isError ? "tool failed" : "tool result"}: ${bound(text, 1500)}`);
+    }
+    return parts.join("\n").trim();
+  }
   for (const block of message?.content ?? []) {
     if (block?.type === "text" && block.text?.trim()) parts.push(block.text.trim());
     if (block?.type === "tool-call") parts.push(`called ${block.name}(${bound(block.arguments, 400)})`);
-    if (block?.type === "tool-result") {
-      const text = (block.content ?? [])
-        .filter(inner => inner?.type === "text")
-        .map(inner => inner.text)
-        .join("\n")
-        .trim();
-      if (text) parts.push(`${block.isError ? "tool failed" : "tool result"}: ${bound(text, 1500)}`);
-    }
+  }
+  for (const result of results) {
+    const text = resultText(result);
+    if (text) parts.push(`${result.isError ? "tool failed" : "tool result"}: ${bound(text, 1500)}`);
   }
   return parts.join("\n").trim();
+}
+
+/** The plain text of one tool result, whatever shape its content arrived in. */
+function resultText(result) {
+  const content = result?.content;
+  if (typeof content === "string") return content.trim();
+  return (Array.isArray(content) ? content : [])
+    .filter(inner => inner?.type === "text")
+    .map(inner => inner.text)
+    .join("\n")
+    .trim();
 }
 
 function bound(value, limit) {

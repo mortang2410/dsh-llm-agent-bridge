@@ -52,6 +52,56 @@ test("a tool call is handed to DSH as a tool-call finish, and the answer resumes
   assert.equal(agent.appended.length, 0, "tool activity belongs to DSH's trajectory, not to a custom event");
 });
 
+test("a DSH 0.2.x tool result message resumes the parked turn", async () => {
+  // DSH 0.2.x builds a tool result as a MESSAGE: role "tool", with the id on
+  // `toolCallId` at message level and no `tool-result` content block at all
+  // (dsh-llm 0.2.0-rc.2 `createToolResultMessage`). 0.1.x instead used a `user`
+  // message holding one `tool-result` block. Reading only for 0.1.x silently
+  // found nothing on the real host: the parked call was never resolved, the turn
+  // was abandoned, and the model was told its tool call had been REJECTED even
+  // though DSH had executed it. Every other test in this file uses the 0.1.x
+  // shape, which is exactly why the suite passed while the real host failed.
+  const runtime = new FakeRuntime();
+  const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve() });
+  const agent = fakeAgent();
+  adapter.attachAgent(agent);
+
+  const messages = [{ role: "user", source: { kind: "user" }, content: [{ type: "text", text: "list the files" }] }];
+  const request = {
+    provider: "claude",
+    model: "sonnet",
+    sessionId: agent.id,
+    messages,
+    tools: [{ name: "bash", description: "Run a command.", parameters: { type: "object", properties: { command: { type: "string" } } } }],
+  };
+
+  const first = await collect(adapter.stream(request));
+  const call = first.find(chunk => chunk.type === "block-end" && chunk.block.type === "tool-call");
+  assert.equal(first.at(-1).reason.kind, "tool-calls");
+
+  const second = await collect(adapter.stream({
+    ...request,
+    messages: [
+      ...messages,
+      {
+        role: "tool",
+        source: { kind: "tool", callId: call.block.id },
+        toolCallId: call.block.id,
+        content: [{ type: "text", text: "/workspace/dsh" }],
+        isError: false,
+      },
+    ],
+  }));
+
+  assert.deepEqual(
+    runtime.resolved.map(entry => entry.toolUseId), [call.block.id],
+    "the 0.2.x message-shaped result must resolve the parked call",
+  );
+  assert.equal(runtime.resolved[0].result.content[0].text, "/workspace/dsh", "the harness result reaches Claude verbatim");
+  assert.equal(runtime.sent.length, 1, "resuming must not start a second Claude turn");
+  assert.equal(second.at(-1).reason.kind, "stop", "the turn resumes and finishes rather than being abandoned");
+});
+
 test("Claude models expose native reasoning effort choices", async () => {
   const runtime = new FakeRuntime();
   const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve() });
