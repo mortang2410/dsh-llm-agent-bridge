@@ -840,3 +840,70 @@ test("a second tool call parked after its model call has ended still joins the s
   const calls = first.filter(chunk => chunk.type === "block-end" && chunk.block.type === "tool-call");
   assert.equal(calls.length, 2, "the step waits for every tool call its model call declared, not only for the model call to end");
 });
+
+/** Usage that lands while a tool runs, between the handoff and the resume. */
+class GapRuntime extends FakeRuntime {
+  async sendMessage(sessionId, message) {
+    this.sent.push({ sessionId, message });
+    const turnId = "turn-1";
+    queueMicrotask(() => {
+      this.emit("activity", notification("usage/apiCall", sessionId, turnId, { callId: "msg-a", usage: { input_tokens: 100, output_tokens: 1 } }));
+      this.parked = { sessionId, turnId };
+      this.emit("activity", notification("tool/parked", sessionId, turnId, {
+        parkId: "park-1", name: message.dshTools[0].name, arguments: { command: "pwd" },
+      }));
+    });
+    return { id: turnId, status: "inProgress", items: [] };
+  }
+
+  resolveToolCall(toolUseId, result) {
+    this.resolved.push({ toolUseId, result });
+    const parked = this.parked;
+    this.parked = null;
+    if (!parked) return false;
+    queueMicrotask(() => {
+      const { sessionId, turnId } = parked;
+      this.emit("activity", notification("usage/apiCall", sessionId, turnId, { callId: "msg-b", usage: { input_tokens: 200, output_tokens: 30 } }));
+      this.emit("activity", notification("usage/apiCallEnded", sessionId, turnId, { callId: "msg-b" }));
+      this.emit("activity", { method: "turn/completed", params: { sessionId, turn: {
+        id: turnId,
+        status: "completed",
+        error: null,
+        items: [],
+        usage: { inputTokens: 300, outputTokens: 50, cacheReadTokens: 0, cacheWriteTokens: 0 },
+      } } });
+    });
+    return true;
+  }
+}
+
+test("usage that lands while a tool runs is counted in the step that resumes", async () => {
+  process.env.DSH_AGENT_BRIDGE_USAGE_SETTLE_MS = "30";
+  try {
+    const runtime = new GapRuntime();
+    const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve() });
+    const agent = fakeAgent();
+    adapter.attachAgent(agent);
+    const messages = [{ role: "user", source: { kind: "user" }, content: [{ type: "text", text: "go" }] }];
+    const request = { provider: "claude", model: "sonnet", sessionId: agent.id, messages, tools: bashTool };
+    const first = await collect(adapter.stream(request));
+    const call = first.find(chunk => chunk.type === "block-end" && chunk.block.type === "tool-call");
+
+    // The first call finishes while DSH is running the tool, after the step has handed off.
+    const { sessionId } = runtime.sent[0];
+    runtime.emit("activity", notification("usage/apiCall", sessionId, "turn-1", { callId: "msg-a", usage: { output_tokens: 20 } }));
+    runtime.emit("activity", notification("usage/apiCallEnded", sessionId, "turn-1", { callId: "msg-a" }));
+
+    const second = await collect(adapter.stream({
+      ...request,
+      messages: [...messages, { role: "user", content: [{ type: "tool-result", toolCallId: call.block.id, content: [{ type: "text", text: "/workspace" }] }] }],
+    }));
+    const firstUsage = first.filter(chunk => chunk.type === "usage").map(chunk => chunk.usage);
+    const secondUsage = second.filter(chunk => chunk.type === "usage").map(chunk => chunk.usage);
+    assert.deepEqual(firstUsage, [{ inputTokens: 100, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 }]);
+    assert.deepEqual(secondUsage, [{ inputTokens: 200, outputTokens: 49, cacheReadTokens: 0, cacheWriteTokens: 0 }],
+      "the 19 output tokens that landed during the tool run are reported with the step that resumes");
+  } finally {
+    delete process.env.DSH_AGENT_BRIDGE_USAGE_SETTLE_MS;
+  }
+});

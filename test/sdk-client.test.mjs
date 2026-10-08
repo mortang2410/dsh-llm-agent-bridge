@@ -268,6 +268,34 @@ test("each model call's usage reaches the harness as the SDK reports it", async 
   assert.deepEqual(reports[2].usage, { input_tokens: 100, cache_read_input_tokens: 0, cache_creation_input_tokens: 40, output_tokens: 20 });
 });
 
+test("a tool block is declared to the harness as soon as it starts streaming", async () => {
+  const sdk = {
+    query(params) {
+      return queryObject(async function* () {
+        yield { type: "stream_event", session_id: params.options.sessionId, uuid: "d1", parent_tool_use_id: null, event: {
+          type: "message_start", message: { id: "msg-declare", usage: { input_tokens: 10, output_tokens: 1 } },
+        } };
+        yield { type: "stream_event", session_id: params.options.sessionId, uuid: "d2", parent_tool_use_id: null, event: {
+          type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "toolu_declared", name: "mcp__dsh__bash", input: {} },
+        } };
+        yield { type: "stream_event", session_id: params.options.sessionId, uuid: "d3", parent_tool_use_id: null, event: { type: "message_stop" } };
+        yield { type: "result", session_id: params.options.sessionId, uuid: "d4", subtype: "success", is_error: false, result: "", usage: {} };
+      });
+    },
+  };
+  const client = new ClaudeSdkClient({ sdk });
+  await client.start();
+  const session = await client.createSession({ sessionId: "33333333-3333-4333-8333-333333333333", cwd: "/workspace/declare" });
+  const activity = [];
+  client.on("activity", message => activity.push(message));
+  await client.sendMessage(session.id, { text: "hi", model: "sonnet", effort: "low" });
+  await untilTurnCompleted(activity);
+
+  const declared = activity.find(message => message.method === "usage/toolUses");
+  assert.ok(declared, "the tool block is declared while the call is still streaming");
+  assert.deepEqual(declared.params, { sessionId: session.id, turnId: declared.params.turnId, callId: "msg-declare", toolUseIds: ["toolu_declared"] });
+});
+
 function queryObject(factory) {
   const iterator = factory();
   return {

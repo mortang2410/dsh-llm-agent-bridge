@@ -24,6 +24,11 @@ export class ClaudeDshAdapter extends LlmAdapter {
     // DSH sessions whose Claude turn is parked on tool calls DSH is executing.
     this.suspended = new Map();
     this.usageLedgers = new Map();
+    // Usage is recorded for the life of the turn, including the gap while a parked
+    // step waits for DSH to run its tools, so no report is lost to that gap.
+    if (runtime && (typeof runtime.subscribeActivity === "function" || typeof runtime.on === "function")) {
+      subscribeRuntimeActivity(runtime, message => this.recordUsageActivity(message));
+    }
     for (const [sessionId, record] of linkStore?.entries() ?? []) {
       const claudeSessionId = record.claudeSessionId ?? record.sessionId ?? record.threadId;
       if (claudeSessionId) this.links.set(sessionId, claudeSessionId);
@@ -253,7 +258,7 @@ export class ClaudeDshAdapter extends LlmAdapter {
     const queue = new ActivityQueue(options.signal, "Claude");
     const onActivity = (message) => {
       const candidate = message.params?.sessionId ?? message.params?.session?.id;
-      if (candidate === claudeSessionId) queue.push(message);
+      if (candidate === claudeSessionId && !String(message.method).startsWith("usage/")) queue.push(message);
     };
     // Subscribe before starting or resuming: a runtime that emits synchronously
     // would otherwise deliver the whole turn before anyone is listening.
@@ -417,6 +422,7 @@ export class ClaudeDshAdapter extends LlmAdapter {
     } finally {
       stopActivity();
       queue.close();
+      if (turnId) this.usageLedgers.delete(turnId);
       await this.runtime.releaseSession(claudeSessionId);
     }
   }
@@ -459,14 +465,12 @@ export class ClaudeDshAdapter extends LlmAdapter {
    */
   async *settleParkedStep(queue, state, batch, turnId) {
     const deadline = Date.now() + usageSettleMs();
-    while (stepIsOpen(state, batch.length) && Date.now() < deadline) {
-      const message = await queue.nextWithin(deadline - Date.now());
-      if (!message) break;
+    while (stepIsOpen(state, batch.length)) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
+      const message = await queue.nextWithin(Math.min(remaining, SETTLE_POLL_MS));
+      if (!message) continue;
       if (message.params?.turnId && message.params.turnId !== turnId) continue;
-      if (String(message.method).startsWith("usage/")) {
-        this.projectActivity(message, state);
-        continue;
-      }
       if (isToolParked(message)) {
         batch.push(message.params);
         continue;
@@ -481,6 +485,14 @@ export class ClaudeDshAdapter extends LlmAdapter {
     batch.push(...drainParkedToolCalls(queue, turnId));
   }
 
+  /** Record one usage activity against its turn's ledger, whatever step is running. */
+  recordUsageActivity(message) {
+    if (!String(message?.method).startsWith("usage/")) return;
+    const turnId = message.params?.turnId;
+    if (!turnId) return;
+    recordUsage({ usage: this.usageLedgerFor(turnId) }, message);
+  }
+
   /** The turn's usage ledger, which outlives each step while the turn is parked. */
   usageLedgerFor(turnId) {
     let ledger = this.usageLedgers.get(turnId);
@@ -493,18 +505,7 @@ export class ClaudeDshAdapter extends LlmAdapter {
 
   projectActivity(message, state) {
     const params = message.params ?? {};
-    if (message.method === "usage/apiCall") {
-      recordCallUsage(state, params.callId, params.usage);
-      return [];
-    }
-    if (message.method === "usage/toolUses") {
-      recordToolUses(state, params.callId, params.toolUseIds);
-      return [];
-    }
-    if (message.method === "usage/apiCallEnded") {
-      state.usage.ended.add(params.callId);
-      return [];
-    }
+    if (String(message.method).startsWith("usage/")) return [];
     if (message.method === "item/reasoning/summaryTextDelta" || message.method === "item/reasoning/textDelta") {
       return textDelta(state, params.itemId, "reasoning", params.delta ?? "");
     }
@@ -734,8 +735,6 @@ function createStreamState(usage = newUsageLedger()) {
     completedActivities: new Set(),
     /** The turn's usage ledger, shared by every DSH step of the turn. */
     usage,
-    /** Calls an earlier step of this turn already started; this step does not wait for them. */
-    preexisting: new Set(usage.calls.keys()),
   };
 }
 
@@ -747,6 +746,9 @@ function newUsageLedger() {
 /** How long a parked step waits for its model calls to finish reporting usage. */
 const STEP_USAGE_SETTLE_MS = 2000;
 
+/** How often a waiting step re-checks the ledger when nothing else arrives. */
+const SETTLE_POLL_MS = 20;
+
 /** The settle limit, overridable for tests with DSH_AGENT_BRIDGE_USAGE_SETTLE_MS. */
 function usageSettleMs() {
   const raw = process.env.DSH_AGENT_BRIDGE_USAGE_SETTLE_MS;
@@ -756,7 +758,7 @@ function usageSettleMs() {
 
 /** True while a model call this step started has not finished reporting usage. */
 function hasOpenCall(state) {
-  return [...state.usage.calls.keys()].some(callId => !state.preexisting.has(callId) && !state.usage.ended.has(callId));
+  return [...state.usage.calls.keys()].some(callId => !state.usage.reported.has(callId) && !state.usage.ended.has(callId));
 }
 
 /** The tool calls a model call declared, which the step waits for before reporting. */
@@ -780,9 +782,17 @@ function stepIsOpen(state, parked) {
 function expectedParks(state) {
   let count = 0;
   for (const [callId, ids] of state.usage.toolUses) {
-    if (!state.preexisting.has(callId)) count += ids.size;
+    if (!state.usage.reported.has(callId)) count += ids.size;
   }
   return count;
+}
+
+/** Record one usage activity against the ledger held in state.usage. */
+function recordUsage(state, message) {
+  const params = message.params ?? {};
+  if (message.method === "usage/apiCall") recordCallUsage(state, params.callId, params.usage);
+  else if (message.method === "usage/toolUses") recordToolUses(state, params.callId, params.toolUseIds);
+  else if (message.method === "usage/apiCallEnded") state.usage.ended.add(params.callId);
 }
 
 /** Record the largest figure seen for each usage field of one model call. */

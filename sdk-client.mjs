@@ -562,6 +562,9 @@ function normalizeSdkMessage(message, state) {
     if (event?.type === "message_delta") {
       events.push(...usageEvents(state.currentMessageId, event.usage));
     }
+    if (event?.type === "content_block_start" && event.content_block?.type === "tool_use" && event.content_block.id && state.currentMessageId) {
+      events.push({ method: "usage/toolUses", params: { callId: state.currentMessageId, toolUseIds: [event.content_block.id] } });
+    }
     if (event?.type === "message_stop" && state.currentMessageId) {
       events.push({ method: "usage/apiCallEnded", params: { callId: state.currentMessageId } });
     }
