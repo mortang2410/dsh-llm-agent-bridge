@@ -83,6 +83,7 @@ test("Claude SDK client pauses on canUseTool and resumes after Relay approval", 
   assert.equal(requests[0].method, "tool/requestApproval");
   assert.equal(requests[0].params.toolName, "Write");
   assert.deepEqual(activity.map(message => message.method), [
+    "usage/toolUses",
     "item/started",
     "item/completed",
     "item/reasoning/summaryTextDelta",

@@ -580,6 +580,10 @@ function normalizeSdkMessage(message, state) {
   if (message.type === "assistant") {
     events.push(...usageEvents(message.message?.id, message.message?.usage));
     const content = message.message?.content ?? [];
+    const toolUseIds = content.filter(block => block.type === "tool_use" && block.id).map(block => block.id);
+    if (toolUseIds.length > 0 && message.message?.id) {
+      events.push({ method: "usage/toolUses", params: { callId: message.message.id, toolUseIds } });
+    }
     for (const [index, block] of content.entries()) {
       if (block.type === "text" && block.text) {
         const itemId = block.id ?? messageItemId(state.text, message, "text", content, index);

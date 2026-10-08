@@ -350,6 +350,7 @@ export class ClaudeDshAdapter extends LlmAdapter {
   /** Release a Claude turn nobody is going to finish, and unpark its tool calls. */
   async abandonTurn(sessionId, { claudeSessionId, turnId }) {
     this.suspended.delete(sessionId);
+    if (turnId) this.usageLedgers.delete(turnId);
     this.runtime.rejectAllToolCalls?.(new Error("The DSH turn was abandoned before the tool result arrived"));
     if (turnId) await this.runtime.interruptTurn(claudeSessionId, turnId).catch(() => {});
   }
@@ -458,7 +459,7 @@ export class ClaudeDshAdapter extends LlmAdapter {
    */
   async *settleParkedStep(queue, state, batch, turnId) {
     const deadline = Date.now() + usageSettleMs();
-    while (hasOpenCall(state) && Date.now() < deadline) {
+    while (stepIsOpen(state, batch.length) && Date.now() < deadline) {
       const message = await queue.nextWithin(deadline - Date.now());
       if (!message) break;
       if (message.params?.turnId && message.params.turnId !== turnId) continue;
@@ -494,6 +495,10 @@ export class ClaudeDshAdapter extends LlmAdapter {
     const params = message.params ?? {};
     if (message.method === "usage/apiCall") {
       recordCallUsage(state, params.callId, params.usage);
+      return [];
+    }
+    if (message.method === "usage/toolUses") {
+      recordToolUses(state, params.callId, params.toolUseIds);
       return [];
     }
     if (message.method === "usage/apiCallEnded") {
@@ -736,7 +741,7 @@ function createStreamState(usage = newUsageLedger()) {
 
 /** Usage bookkeeping for one Claude turn. */
 function newUsageLedger() {
-  return { calls: new Map(), reported: new Map(), ended: new Set() };
+  return { calls: new Map(), reported: new Map(), ended: new Set(), toolUses: new Map() };
 }
 
 /** How long a parked step waits for its model calls to finish reporting usage. */
@@ -752,6 +757,32 @@ function usageSettleMs() {
 /** True while a model call this step started has not finished reporting usage. */
 function hasOpenCall(state) {
   return [...state.usage.calls.keys()].some(callId => !state.preexisting.has(callId) && !state.usage.ended.has(callId));
+}
+
+/** The tool calls a model call declared, which the step waits for before reporting. */
+function recordToolUses(state, callId, toolUseIds) {
+  if (!callId || !Array.isArray(toolUseIds)) return;
+  const ids = state.usage.toolUses.get(callId) ?? new Set();
+  for (const id of toolUseIds) ids.add(id);
+  state.usage.toolUses.set(callId, ids);
+}
+
+/**
+ * True while this step still has something to wait for: a model call that has not
+ * ended, or a declared tool call that has not parked yet. The second condition
+ * covers a tool call parked after its model call has ended. If a declared tool
+ * call is never parked, the wait still ends at the settle limit.
+ */
+function stepIsOpen(state, parked) {
+  return hasOpenCall(state) || expectedParks(state) > parked;
+}
+
+function expectedParks(state) {
+  let count = 0;
+  for (const [callId, ids] of state.usage.toolUses) {
+    if (!state.preexisting.has(callId)) count += ids.size;
+  }
+  return count;
 }
 
 /** Record the largest figure seen for each usage field of one model call. */

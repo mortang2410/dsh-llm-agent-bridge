@@ -798,3 +798,45 @@ test("aborting a step while its usage is pending ends the turn at once", async (
   assert.ok(Date.now() - started < 1000, "the usage wait does not hold an aborted turn for its full limit");
   assert.equal(chunks.at(-1).reason.kind, "aborted");
 });
+
+/** A step whose second tool call parks only after its model call has ended. */
+class LateParkRuntime extends FakeRuntime {
+  async sendMessage(sessionId, message) {
+    this.sent.push({ sessionId, message });
+    const turnId = "turn-1";
+    queueMicrotask(() => {
+      this.emit("activity", notification("usage/apiCall", sessionId, turnId, { callId: "msg-a", usage: { input_tokens: 100 } }));
+      this.emit("activity", notification("usage/toolUses", sessionId, turnId, { callId: "msg-a", toolUseIds: ["t1", "t2"] }));
+      this.parked = { sessionId, turnId };
+      this.emit("activity", notification("tool/parked", sessionId, turnId, {
+        parkId: "park-1", name: message.dshTools[0].name, arguments: { command: "pwd" },
+      }));
+      setTimeout(() => {
+        this.emit("activity", notification("usage/apiCall", sessionId, turnId, { callId: "msg-a", usage: { output_tokens: 20 } }));
+        this.emit("activity", notification("usage/apiCallEnded", sessionId, turnId, { callId: "msg-a" }));
+      }, 10);
+      setTimeout(() => {
+        this.emit("activity", notification("tool/parked", sessionId, turnId, {
+          parkId: "park-2", name: message.dshTools[0].name, arguments: { command: "date" },
+        }));
+      }, 40);
+    });
+    return { id: turnId, status: "inProgress", items: [] };
+  }
+}
+
+test("a second tool call parked after its model call has ended still joins the step", async () => {
+  const runtime = new LateParkRuntime();
+  const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve() });
+  const agent = fakeAgent();
+  adapter.attachAgent(agent);
+  const first = await collect(adapter.stream({
+    provider: "claude",
+    model: "sonnet",
+    sessionId: agent.id,
+    messages: [{ role: "user", source: { kind: "user" }, content: [{ type: "text", text: "go" }] }],
+    tools: bashTool,
+  }));
+  const calls = first.filter(chunk => chunk.type === "block-end" && chunk.block.type === "tool-call");
+  assert.equal(calls.length, 2, "the step waits for every tool call its model call declared, not only for the model call to end");
+});

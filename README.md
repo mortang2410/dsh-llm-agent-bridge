@@ -40,11 +40,12 @@ that adapter:
    token usage and the model's context window so DSH's own counters —
    input, output, cache-hit rate, tokens/sec, context pressure — work for Claude
    rows exactly as they do for its own. Each DSH step is one Claude model call, since
-   the bridge parks at every tool request, so context pressure is that call's
-   prompt and tokens/sec is measured per step. Usage is reported as the SDK
-   streams it; a figure that arrives after its step has reported is counted in
-   the next step, once. Claude reports reasoning tokens only for the whole turn,
-   so that count rides on the turn's final step. The plugin
+   the bridge parks at every tool request. Context pressure is the prompt that
+   call reported when it started, and tokens/sec is measured per step. Usage is
+   reported as the SDK streams it; a figure that arrives after its step has
+   reported is counted in the next step, once. Claude reports reasoning tokens
+   only for the whole turn, so that count rides on the turn's final step when
+   that step made a call. The plugin
    contributes no client bundle and no renderer of its own: tool work is DSH's
    to display, from its own trajectory.
 
