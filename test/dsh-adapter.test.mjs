@@ -738,6 +738,80 @@ test("two resumes, each carrying a steer, deliver each steer once and in order",
   assert.equal(onSecond.split("first steer").length - 1, 0, "the first steer is not delivered again");
 });
 
+test("a resumed turn that fails after its results are delivered offers the steer again", async () => {
+  const runtime = new FakeRuntime();
+  runtime.resolveToolCall = function (toolUseId, result) {
+    this.resolved.push({ toolUseId, result });
+    return true; // accepted, but the turn never emits again
+  };
+  const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve() });
+  const agent = fakeAgent();
+  adapter.attachAgent(agent);
+  const go = { role: "user", source: { kind: "user" }, content: [{ type: "text", text: "go" }] };
+  const steer = { role: "user", source: { kind: "user" }, content: [{ type: "text", text: "also check the audio output" }] };
+  const next = { role: "user", source: { kind: "user" }, content: [{ type: "text", text: "never mind, check the logs" }] };
+
+  const first = await collect(adapter.stream({ provider: "claude", model: "sonnet", sessionId: agent.id, messages: [go], tools: bashTool }));
+  const call = first.find(chunk => chunk.type === "block-end" && chunk.block.type === "tool-call").block;
+  const result = {
+    role: "tool", source: { kind: "tool", callId: call.id }, toolCallId: call.id,
+    content: [{ type: "text", text: "/workspace/dsh" }], isError: false,
+  };
+
+  // The steer rides on the result, the result is delivered, and then the resumed turn never speaks.
+  process.env.DSH_AGENT_BRIDGE_RESUME_TIMEOUT_MS = "80";
+  try {
+    await assert.rejects(
+      collect(adapter.stream({ provider: "claude", model: "sonnet", sessionId: agent.id, messages: [go, result, steer], tools: bashTool })),
+      /did not respond within/,
+    );
+  } finally {
+    delete process.env.DSH_AGENT_BRIDGE_RESUME_TIMEOUT_MS;
+  }
+
+  const retry = await collect(adapter.stream({ provider: "claude", model: "sonnet", sessionId: agent.id, messages: [go, result, steer, next] }));
+  assert.equal(retry.at(-1).reason.kind, "stop");
+  assert.equal(runtime.sent.length, 2, "the retry is a new Claude turn");
+  assert.equal(runtime.sent[1].message.text.split("also check the audio output").length - 1, 1, "the steer is offered again, once");
+});
+
+test("a turn that throws after its message was accepted offers the message again", async () => {
+  const runtime = new MalformedCompletionRuntime();
+  const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve() });
+  const agent = fakeAgent();
+  adapter.attachAgent(agent);
+  const go = { role: "user", source: { kind: "user" }, content: [{ type: "text", text: "go" }] };
+  const next = { role: "user", source: { kind: "user" }, content: [{ type: "text", text: "try again" }] };
+
+  // The send is accepted; the completion's items cannot be read, so the turn throws.
+  await assert.rejects(collect(adapter.stream({ provider: "claude", model: "sonnet", sessionId: agent.id, messages: [go] })), TypeError);
+
+  const retry = await collect(adapter.stream({ provider: "claude", model: "sonnet", sessionId: agent.id, messages: [go, next] }));
+  assert.equal(retry.at(-1).reason.kind, "stop");
+  assert.match(runtime.sent[1].message.text, /user: go/, "the message of the turn that threw is offered again");
+});
+
+test("a user abort leaves the message delivered, so the next turn does not offer it again", async () => {
+  const runtime = new SilentTurnRuntime();
+  const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve() });
+  const agent = fakeAgent();
+  adapter.attachAgent(agent);
+  const go = { role: "user", source: { kind: "user" }, content: [{ type: "text", text: "go" }] };
+  const next = { role: "user", source: { kind: "user" }, content: [{ type: "text", text: "never mind, check the logs" }] };
+
+  // The send is accepted, and the turn never completes until the user stops it.
+  const controller = new AbortController();
+  setTimeout(() => controller.abort(), 50);
+  const aborted = await collect(adapter.stream({
+    provider: "claude", model: "sonnet", sessionId: agent.id, signal: controller.signal, messages: [go],
+  }));
+  assert.equal(aborted.at(-1).reason.kind, "aborted");
+
+  const retry = await collect(adapter.stream({ provider: "claude", model: "sonnet", sessionId: agent.id, messages: [go, next] }));
+  assert.equal(retry.at(-1).reason.kind, "stop");
+  assert.equal(runtime.sent[1].message.text, "never mind, check the logs", "the aborted message is not offered again");
+});
+
 test("a message whose turn ends failed is offered again on the next turn", async () => {
   const runtime = new FailingFirstTurnRuntime();
   const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve() });
@@ -1407,6 +1481,27 @@ class ReparkOnResumeRuntime extends FakeRuntime {
   }
 }
 
+/** The first turn's completion reports items the adapter cannot read, so the turn throws after its send. */
+class MalformedCompletionRuntime extends FakeRuntime {
+  async sendMessage(sessionId, message) {
+    if (this.sent.length > 0) return super.sendMessage(sessionId, message);
+    this.sent.push({ sessionId, message });
+    queueMicrotask(() => this.emit("activity", { method: "turn/completed", params: { sessionId, turn: {
+      id: "turn-1", status: "completed", error: null, items: 5, usage: {},
+    } } }));
+    return { id: "turn-1", status: "inProgress", items: [] };
+  }
+}
+
+/** The first turn is accepted and then never completes, until the user stops it. */
+class SilentTurnRuntime extends FakeRuntime {
+  async sendMessage(sessionId, message) {
+    if (this.sent.length > 0) return super.sendMessage(sessionId, message);
+    this.sent.push({ sessionId, message });
+    return { id: "turn-1", status: "inProgress", items: [] };
+  }
+}
+
 /** The first send is refused by the runtime before Claude receives it. */
 class RejectingFirstSendRuntime extends FakeRuntime {
   async sendMessage(sessionId, message) {
@@ -1739,4 +1834,58 @@ test("a turn whose consumer stopped early leaves no ledger once it completes", a
   }
   await new Promise(resolve => setTimeout(resolve, 5));
   assert.equal(adapter.usageLedgers.size, 0, "completion with no live reader drops the ledger");
+});
+
+test("green: a queued message typed mid-tool starts its own turn after the resumed turn ends", async () => {
+  const runtime = new FakeRuntime();
+  const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve() });
+  const agent = fakeAgent();
+  adapter.attachAgent(agent);
+  agent.session.append("turn/start", { turn: 1 });
+  const go = { role: "user", source: { kind: "user" }, content: [{ type: "text", text: "go" }] };
+  const first = await collect(adapter.stream({
+    provider: "claude", model: "sonnet", sessionId: agent.id, messages: [go], tools: bashTool,
+  }));
+  const call = first.find(chunk => chunk.type === "block-end" && chunk.block.type === "tool-call").block;
+  // Green waits in DSH's next-turn band, so it is absent from the resume.
+  const result = {
+    role: "tool", source: { kind: "tool", callId: call.id }, toolCallId: call.id,
+    content: [{ type: "text", text: "/workspace/dsh" }], isError: false,
+  };
+  const second = await collect(adapter.stream({
+    provider: "claude", model: "sonnet", sessionId: agent.id, messages: [go, result], tools: bashTool,
+  }));
+  assert.equal(runtime.resolved.length, 1, "the parked call resumes");
+  assert.equal(second.at(-1).reason.kind, "stop", "the resumed turn completes");
+  // DSH ends turn 1, then claims the queued row as turn 2's input.
+  agent.session.append("turn/end", { turn: 1, reason: { kind: "completed" } });
+  agent.session.append("turn/start", { turn: 2 });
+  const green = { role: "user", source: { kind: "user" }, content: [{ type: "text", text: "GREEN-MSG-XYZ" }] };
+  const third = await collect(adapter.stream({
+    provider: "claude", model: "sonnet", sessionId: agent.id, messages: [go, result, green],
+  }));
+  assert.equal(runtime.sent.length, 2, "the green message starts a new Claude turn");
+  assert.equal(runtime.sent[1].message.text, "GREEN-MSG-XYZ", "the green message is the prompt, once");
+  assert.equal(third.at(-1).reason.kind, "stop");
+});
+
+test("a developer or system message that arrives while a tool runs reaches Claude with the tool's result", async () => {
+  const runtime = new FakeRuntime();
+  const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve() });
+  const agent = fakeAgent();
+  adapter.attachAgent(agent);
+  agent.session.append("turn/start", { turn: 1 });
+  const go = { role: "user", source: { kind: "user" }, content: [{ type: "text", text: "go" }] };
+  const first = await collect(adapter.stream({ provider: "claude", model: "sonnet", sessionId: agent.id, messages: [go], tools: bashTool }));
+  const call = first.find(chunk => chunk.type === "block-end" && chunk.block.type === "tool-call").block;
+  const result = {
+    role: "tool", source: { kind: "tool", callId: call.id }, toolCallId: call.id,
+    content: [{ type: "text", text: "/workspace/dsh" }], isError: false,
+  };
+  // DSH adds a developer notice while the tool runs. Marking it delivered without sending it would lose it.
+  const notice = { role: "developer", source: { kind: "runtime" }, content: [{ type: "text", text: "NOTICE-SANDBOX-READ-ONLY" }] };
+  await collect(adapter.stream({ provider: "claude", model: "sonnet", sessionId: agent.id, messages: [go, result, notice], tools: bashTool }));
+  assert.equal(runtime.resolved.length, 1, "the parked call resumes");
+  const delivered = runtime.resolved[0].result.content.map(block => block.text ?? "").join("\n");
+  assert.match(delivered, /NOTICE-SANDBOX-READ-ONLY/, "the notice must reach Claude, not be marked delivered and dropped");
 });

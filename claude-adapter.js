@@ -514,7 +514,7 @@ export class ClaudeDshAdapter extends LlmAdapter {
     const delivered = this.seen.get(String(sessionId)) ?? 0;
     return messages
       .slice(delivered)
-      .filter(message => message?.role === "user" && toolResultsIn(message).length === 0 && messageText(message));
+      .filter(message => ["user", "system", "developer"].includes(message?.role) && toolResultsIn(message).length === 0 && messageText(message));
   }
 
   /** Record the DSH log position the Claude transcript now holds, and persist it. */
