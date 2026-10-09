@@ -115,14 +115,15 @@ export class ClaudeSessionRuntime extends EventEmitter {
   }
 
   async sendMessage(sessionId, {
-    text, model, effort, sandbox, approvalPolicy, cwd,
+    text, images, model, effort, sandbox, approvalPolicy, cwd,
     // Per-turn, owned by the caller rather than by session state: the harness's
     // assembled prompt and its tool bridge. These must reach the client
     // untouched — dropping them leaves the model with no tools at all.
     systemPrompt, settingSources, dshTools, executeDshTool, permissionMode, thinkingSummaries,
   } = {}) {
     const session = this.requireSession(sessionId);
-    if (!text?.trim()) throw new Error("message text is required");
+    const hasImages = Array.isArray(images) && images.length > 0;
+    if (!text?.trim() && !hasImages) throw new Error("message text is required");
     const next = {
       model: model ?? session.model,
       effort: effort ?? session.effort,
@@ -133,6 +134,7 @@ export class ClaudeSessionRuntime extends EventEmitter {
     Object.assign(session, next, { updatedAt: nowSeconds() });
     const turn = await this.client.sendMessage(sessionId, {
       text,
+      ...(hasImages ? { images } : {}),
       ...next,
       ...(systemPrompt !== undefined ? { systemPrompt } : {}),
       ...(settingSources !== undefined ? { settingSources } : {}),

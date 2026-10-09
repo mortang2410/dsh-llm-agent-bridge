@@ -11,10 +11,11 @@ export const CLAUDE_PROVIDER = "claude";
 const PARKED_TURN_NOTE = "Earlier tool calls for this request already ran. Their results, or the summary of them, are in the context above; continue from them and do not repeat those calls.";
 
 export class ClaudeDshAdapter extends LlmAdapter {
-  constructor({ runtime, ready, linkStore = null, logger = console, telemetry = scanOnlyTelemetryControl(), thinkingSummaries = true }) {
+  constructor({ runtime, ready, linkStore = null, logger = console, telemetry = scanOnlyTelemetryControl(), thinkingSummaries = true, resolveAttachments = () => undefined }) {
     super();
     this.telemetry = telemetry;
     this.thinkingSummaries = thinkingSummaries;
+    this.resolveAttachments = resolveAttachments;
     this.runtime = runtime;
     this.ready = ready;
     this.logger = logger;
@@ -259,7 +260,7 @@ export class ClaudeDshAdapter extends LlmAdapter {
       if (results.length && !superseded) {
         // Messages DSH received while the tool ran ride on its result: a running Claude
         // query cannot take a new user message.
-        const inputs = this.undeliveredInput(sessionId, options.messages);
+        const inputs = await this.prepareInputs(this.undeliveredInput(sessionId, options.messages), options.signal);
         debugLog("resume", { sessionId, turnId: suspended.turnId, resolving: results.map(result => result.toolCallId), inputs: inputs.length });
         this.markBuilt(sessionId, agent);
         const deliveredBefore = this.seen.get(String(sessionId));
@@ -286,8 +287,9 @@ export class ClaudeDshAdapter extends LlmAdapter {
     }
 
     const instruction = latestUserIndex(options.messages);
-    const text = instruction === -1 ? "" : messageText(options.messages[instruction]);
-    if (!text) throw new Error("The Claude adapter received no user text");
+    if (instruction === -1) throw new Error("The Claude adapter received no user text");
+    const input = await this.prepareInput(options.messages[instruction], options.signal);
+    if (!input.text && input.images.length === 0) throw new Error("The Claude adapter received no user text");
     const nativePermissions = permissionConfiguration(sessionEventLog(agent.session));
     const config = this.configure(sessionId, {
       model: options.model,
@@ -298,12 +300,13 @@ export class ClaudeDshAdapter extends LlmAdapter {
     });
     const dshTools = structuredClone(options.tools ?? []);
     const claudeSessionId = await this.ensureSession(sessionId);
-    const seeded = this.seedPrompt(sessionId, options.messages, instruction, text);
+    const seeded = this.seedPrompt(sessionId, options.messages, instruction, input.text);
     const prompt = parkedTurnRewritten ? `${seeded}\n\n${PARKED_TURN_NOTE}` : seeded;
     this.markBuilt(sessionId, agent);
     const deliveredBefore = this.seen.get(String(sessionId));
     yield* this.runTurn(agent, sessionId, claudeSessionId, options, async () => {
-      const started = await this.runtime.sendMessage(claudeSessionId, { text: prompt, ...config, dshTools });
+      const images = input.images.length > 0 ? { images: input.images } : {};
+      const started = await this.runtime.sendMessage(claudeSessionId, { text: prompt, ...images, ...config, dshTools });
       this.markDelivered(sessionId, options.messages);
       return started.id;
     }, { onFailed: () => this.restoreDelivered(sessionId, deliveredBefore) });
@@ -412,7 +415,9 @@ export class ClaudeDshAdapter extends LlmAdapter {
         yield { type: "finish", reason: { kind: "aborted", failure: { message: "Claude turn cancelled", code: "ABORTED" } } };
         return;
       }
-      this.suspended.delete(sessionId);
+      // A thrown turn can still have a live query, such as a resume parked inside the SDK.
+      // Interrupt it, so a retry cannot run beside the old query on the same transcript.
+      if (turnId) await this.abandonTurn(sessionId, { claudeSessionId, turnId });
       onFailed?.();
       throw error;
     } finally {
@@ -514,7 +519,54 @@ export class ClaudeDshAdapter extends LlmAdapter {
     const delivered = this.seen.get(String(sessionId)) ?? 0;
     return messages
       .slice(delivered)
-      .filter(message => ["user", "system", "developer"].includes(message?.role) && toolResultsIn(message).length === 0 && messageText(message));
+      .filter(message => ["user", "system", "developer"].includes(message?.role) && toolResultsIn(message).length === 0 && hasUserInput(message));
+  }
+
+  /**
+   * One DSH message as Claude receives it: its text, with a line naming each image, and
+   * the bytes of each image the attachment service could read. An image that cannot be
+   * read is still named in the text, so its message is delivered and Claude knows it was sent.
+   */
+  async prepareInput(message, signal) {
+    const parts = [];
+    const images = [];
+    for (const block of message?.content ?? []) {
+      if (block?.type === "text") parts.push(block.text);
+      if (block?.type !== "image") continue;
+      // DSH offloads an image to keep the request within its limits, and sends only its placeholder.
+      if (block.offloaded === true) {
+        parts.push(`[image omitted to fit request image limits: ${imageName(block)}]`);
+        continue;
+      }
+      const image = await this.readImage(block, signal);
+      if (image) {
+        images.push(image);
+        parts.push(`[image: ${image.name}]`);
+      } else {
+        parts.push(`[image could not be read: ${imageName(block)}]`);
+      }
+    }
+    return { source: message?.source, text: parts.join("\n").trim(), images };
+  }
+
+  async prepareInputs(messages, signal) {
+    const prepared = [];
+    for (const message of messages) prepared.push(await this.prepareInput(message, signal));
+    return prepared;
+  }
+
+  /** Read one image's bytes through the host's attachment service; null when they cannot be read. */
+  async readImage(block, signal) {
+    const ref = block.attachment;
+    try {
+      const attachments = this.resolveAttachments();
+      if (attachments === undefined || typeof attachments.readImageRequest !== "function" || !ref) return null;
+      const prepared = await attachments.readImageRequest(ref, imageRequestTarget(ref), signal);
+      return { mediaType: prepared.mediaType, data: Buffer.from(prepared.data).toString("base64"), name: imageName(block) };
+    } catch (error) {
+      this.logger?.warn?.(`Could not read image ${imageName(block)} for Claude: ${error?.message ?? error}`);
+      return null;
+    }
   }
 
   /** Record the DSH log position the Claude transcript now holds, and persist it. */
@@ -1165,16 +1217,17 @@ function resultsWithInput(results, inputs) {
   const typed = inputs.filter(message => USER_SOURCE_KINDS.has(message.source?.kind));
   const context = inputs.filter(message => !USER_SOURCE_KINDS.has(message.source?.kind));
   const notes = [
-    typed.length > 0 && `Input received while this tool ran:\n\n${typed.map(message => messageText(message)).join("\n\n")}`,
-    context.length > 0 && `Context received while this tool ran:\n\n${context.map(message => messageText(message)).join("\n\n")}`,
+    typed.length > 0 && `Input received while this tool ran:\n\n${typed.map(input => input.text).join("\n\n")}`,
+    context.length > 0 && `Context received while this tool ran:\n\n${context.map(input => input.text).join("\n\n")}`,
   ].filter(Boolean);
+  const images = inputs.flatMap(input => input.images.map(image => ({ type: "image", data: image.data, mediaType: image.mediaType })));
   const last = results.length - 1;
   return results.map((result, index) => {
     if (index !== last) return result;
     const content = Array.isArray(result.content) ? result.content : [{ type: "text", text: String(result.content ?? "") }];
     return {
       ...result,
-      content: [...content, ...notes.map(text => ({ type: "text", text }))],
+      content: [...content, ...notes.map(text => ({ type: "text", text })), ...images],
     };
   });
 }
@@ -1240,7 +1293,7 @@ function latestUserIndex(messages) {
   let fallback = -1;
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index];
-    if (message?.role !== "user" || !messageText(message)) continue;
+    if (message?.role !== "user" || !hasUserInput(message)) continue;
     if (message.source?.kind === "user") return index;
     if (fallback === -1) fallback = index;
   }
@@ -1274,6 +1327,7 @@ function seedText(message) {
   }
   for (const block of message?.content ?? []) {
     if (block?.type === "text" && block.text?.trim()) parts.push(block.text.trim());
+    if (block?.type === "image") parts.push(`[image: ${imageName(block)}]`);
     if (block?.type === "tool-call") parts.push(`called ${block.name}(${bound(block.arguments, 400)})`);
   }
   for (const result of results) {
@@ -1292,6 +1346,32 @@ function resultText(result) {
     .map(inner => inner.text)
     .join("\n")
     .trim();
+}
+
+/** Longest edge, in pixels, of an image sent to Claude. Claude downsizes larger images itself. */
+const IMAGE_MAX_EDGE = 4096;
+/** Encoded-byte target per image. The API limits the base64 text to 5 MB, and base64 is a third larger than the bytes. */
+const IMAGE_MAX_BYTES = 3_750_000;
+
+/** The size an image is requested at: its longest edge capped, and the byte target. */
+function imageRequestTarget(ref) {
+  const longest = Math.max(ref.width, ref.height);
+  const scale = longest > IMAGE_MAX_EDGE ? IMAGE_MAX_EDGE / longest : 1;
+  return {
+    width: Math.max(1, Math.round(ref.width * scale)),
+    height: Math.max(1, Math.round(ref.height * scale)),
+    maxBytes: IMAGE_MAX_BYTES,
+  };
+}
+
+/** The name an image is shown under: the one DSH gave it, else its opaque id. */
+function imageName(block) {
+  return block?.attachment?.name ?? block?.attachment?.attachmentId ?? "image";
+}
+
+/** True when a DSH message carries something the user typed: text, or an image. */
+function hasUserInput(message) {
+  return messageText(message) !== "" || (message?.content ?? []).some(block => block?.type === "image");
 }
 
 function bound(value, limit) {

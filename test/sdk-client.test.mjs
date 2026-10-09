@@ -573,3 +573,44 @@ test("the gateway environment is exactly the parent's plus the two routing varia
     }
   }
 });
+
+test("a message with images reaches the SDK as one user message with base64 image blocks", async () => {
+  let captured = null;
+  const sdk = {
+    query(params) {
+      captured = params;
+      return queryObject(async function* () {});
+    },
+  };
+  const client = new ClaudeSdkClient({ sdk });
+  const session = await client.createSession({ sessionId: "33333333-3333-4333-8333-333333333333" });
+  await client.sendMessage(session.id, { text: "look at this", images: [{ mediaType: "image/png", data: "AAAA" }] });
+  assert.equal(typeof captured.prompt[Symbol.asyncIterator], "function", "an image prompt is a stream of user messages");
+  const yielded = [];
+  for await (const message of captured.prompt) yielded.push(message);
+  assert.deepEqual(yielded, [{
+    type: "user",
+    message: {
+      role: "user",
+      content: [
+        { type: "text", text: "look at this" },
+        { type: "image", source: { type: "base64", media_type: "image/png", data: "AAAA" } },
+      ],
+    },
+    parent_tool_use_id: null,
+  }]);
+});
+
+test("a message without images keeps a plain string prompt", async () => {
+  let captured = null;
+  const sdk = {
+    query(params) {
+      captured = params;
+      return queryObject(async function* () {});
+    },
+  };
+  const client = new ClaudeSdkClient({ sdk });
+  const session = await client.createSession({ sessionId: "44444444-4444-4444-8444-444444444444" });
+  await client.sendMessage(session.id, { text: "plain text" });
+  assert.equal(captured.prompt, "plain text");
+});

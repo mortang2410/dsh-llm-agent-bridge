@@ -150,3 +150,16 @@ test("the runtime forwards the harness prompt and tool bridge to the client", as
   assert.deepEqual(sent[0].dshTools.map(tool => tool.name), ["bash"], "dropping the bridge leaves the model with no tools");
   assert.equal(sent[0].executeDshTool, executeDshTool);
 });
+
+test("images on a message reach the client, and an image-only message is accepted", async () => {
+  const client = new FakeClaudeClient();
+  const runtime = new ClaudeSessionRuntime({ client, cwd: "/workspace/relay" });
+  await runtime.initialize();
+  const session = await runtime.createSession({ model: "sonnet" });
+  const images = [{ mediaType: "image/png", data: "AAAA", name: "shot.png" }];
+  await runtime.sendMessage(session.id, { text: "[image: shot.png]", images });
+  assert.deepEqual(client.sent.at(-1).message.images, images, "the images must reach the client, not be dropped");
+  await runtime.sendMessage(session.id, { text: "", images });
+  assert.deepEqual(client.sent.at(-1).message.images, images, "an image with no text is still a message");
+  await runtime.close();
+});

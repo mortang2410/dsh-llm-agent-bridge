@@ -1205,6 +1205,8 @@ test("a resumed turn that never speaks fails instead of stalling forever", async
   } finally {
     delete process.env.DSH_AGENT_BRIDGE_RESUME_TIMEOUT_MS;
   }
+  assert.deepEqual(runtime.interrupted, [{ sessionId: runtime.sent[0].sessionId, turnId: "turn-1" }],
+    "the silent turn is interrupted, so a retry cannot run beside it");
 });
 
 test("a resume that cannot start releases the turn's usage, and nothing is left behind", async () => {
@@ -1869,6 +1871,111 @@ test("green: a queued message typed mid-tool starts its own turn after the resum
   assert.equal(third.at(-1).reason.kind, "stop");
 });
 
+// Images: DSH hands the adapter a durable attachment reference. The bytes come from the host's
+// attachment service, so the adapter reads them and sends them as image blocks.
+const PNG_BYTES = new Uint8Array([137, 80, 78, 71]);
+const shotBlock = {
+  type: "image",
+  attachment: { attachmentId: "att-1", mediaType: "image/png", bytes: 4, width: 640, height: 480, name: "shot.png" },
+};
+function fakeAttachments({ fail = false } = {}) {
+  const reads = [];
+  return {
+    reads,
+    async readImageRequest(ref, target) {
+      reads.push({ ref, target });
+      if (fail) throw new Error("attachment is missing");
+      return { variantId: `v-${ref.attachmentId}`, attachment: ref, data: PNG_BYTES, mediaType: ref.mediaType, bytes: PNG_BYTES.length, width: target.width, height: target.height };
+    },
+  };
+}
+
+test("an image-only message reaches Claude as an image block, named in its text", async () => {
+  const runtime = new FakeRuntime();
+  const attachments = fakeAttachments();
+  const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve(), resolveAttachments: () => attachments });
+  const agent = fakeAgent();
+  adapter.attachAgent(agent);
+  const picture = { role: "user", source: { kind: "user" }, content: [shotBlock] };
+  const chunks = await collect(adapter.stream({ provider: "claude", model: "sonnet", sessionId: agent.id, messages: [picture] }));
+  assert.equal(chunks.at(-1).reason.kind, "stop");
+  assert.equal(runtime.sent.length, 1, "an image-only message starts a turn");
+  assert.match(runtime.sent[0].message.text, /\[image: shot\.png\]/);
+  assert.deepEqual(runtime.sent[0].message.images, [{ mediaType: "image/png", data: Buffer.from(PNG_BYTES).toString("base64"), name: "shot.png" }]);
+  assert.equal(attachments.reads.length, 1, "the bytes are read once");
+});
+
+test("an image sent while a tool runs reaches Claude on the tool's result, and is delivered once", async () => {
+  const runtime = new FakeRuntime();
+  const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve(), resolveAttachments: () => fakeAttachments() });
+  const agent = fakeAgent();
+  adapter.attachAgent(agent);
+  agent.session.append("turn/start", { turn: 1 });
+  const go = { role: "user", source: { kind: "user" }, content: [{ type: "text", text: "go" }] };
+  const first = await collect(adapter.stream({ provider: "claude", model: "sonnet", sessionId: agent.id, messages: [go], tools: bashTool }));
+  const call = first.find(chunk => chunk.type === "block-end" && chunk.block.type === "tool-call").block;
+  const result = {
+    role: "tool", source: { kind: "tool", callId: call.id }, toolCallId: call.id,
+    content: [{ type: "text", text: "/workspace/dsh" }], isError: false,
+  };
+  const steer = { role: "user", source: { kind: "user" }, content: [shotBlock] };
+  const second = await collect(adapter.stream({ provider: "claude", model: "sonnet", sessionId: agent.id, messages: [go, result, steer], tools: bashTool }));
+  assert.equal(second.at(-1).reason.kind, "stop");
+  assert.equal(runtime.resolved.length, 1, "the parked call resumes with the image attached");
+  const blocks = runtime.resolved[0].result.content;
+  const image = blocks.find(block => block.type === "image");
+  assert.ok(image, "the image reaches Claude on the tool result");
+  assert.equal(image.mimeType, "image/png");
+  assert.equal(image.data, Buffer.from(PNG_BYTES).toString("base64"));
+  assert.match(blocks.map(block => block.text ?? "").join("\n"), /\[image: shot\.png\]/);
+  assert.equal(runtime.sent.length, 1, "the image joins the resumed turn rather than starting a new one");
+
+  const next = { role: "user", source: { kind: "user" }, content: [{ type: "text", text: "next" }] };
+  await collect(adapter.stream({ provider: "claude", model: "sonnet", sessionId: agent.id, messages: [go, result, steer, next], tools: bashTool }));
+  assert.equal(runtime.sent.length, 2);
+  assert.equal(runtime.sent[1].message.images, undefined, "the image was delivered once, so the next turn does not carry it again");
+});
+
+test("an image that cannot be read is named in the text, and its message is still delivered once", async () => {
+  const runtime = new FakeRuntime();
+  const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve(), resolveAttachments: () => fakeAttachments({ fail: true }) });
+  const agent = fakeAgent();
+  adapter.attachAgent(agent);
+  const picture = { role: "user", source: { kind: "user" }, content: [shotBlock] };
+  await collect(adapter.stream({ provider: "claude", model: "sonnet", sessionId: agent.id, messages: [picture] }));
+  assert.match(runtime.sent[0].message.text, /\[image could not be read: shot\.png\]/, "Claude is told an image existed");
+  assert.equal(runtime.sent[0].message.images, undefined);
+  const next = { role: "user", source: { kind: "user" }, content: [{ type: "text", text: "next" }] };
+  await collect(adapter.stream({ provider: "claude", model: "sonnet", sessionId: agent.id, messages: [picture, next] }));
+  assert.equal(runtime.sent[1].message.text, "next", "the unreadable image is not offered again");
+});
+
+test("with no attachment service, an image is named in the text rather than dropped", async () => {
+  const runtime = new FakeRuntime();
+  const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve() });
+  const agent = fakeAgent();
+  adapter.attachAgent(agent);
+  await collect(adapter.stream({
+    provider: "claude", model: "sonnet", sessionId: agent.id,
+    messages: [{ role: "user", source: { kind: "user" }, content: [shotBlock] }],
+  }));
+  assert.equal(runtime.sent.length, 1, "the message is not dropped");
+  assert.match(runtime.sent[0].message.text, /\[image could not be read: shot\.png\]/);
+});
+
+test("an image in earlier history reaches a fresh Claude session as a named placeholder, not as bytes", async () => {
+  const runtime = new FakeRuntime();
+  const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve(), resolveAttachments: () => fakeAttachments() });
+  const agent = fakeAgent();
+  adapter.attachAgent(agent);
+  const earlier = { role: "user", source: { kind: "user" }, content: [shotBlock] };
+  const now = { role: "user", source: { kind: "user" }, content: [{ type: "text", text: "what changed?" }] };
+  await collect(adapter.stream({ provider: "claude", model: "sonnet", sessionId: agent.id, messages: [earlier, now] }));
+  assert.match(runtime.sent[0].message.text, /\[image: shot\.png\]/, "the earlier image is named as context");
+  assert.equal(runtime.sent[0].message.images, undefined, "context images are not re-sent as bytes");
+  assert.match(runtime.sent[0].message.text, /what changed\?$/);
+});
+
 test("a developer or system message that arrives while a tool runs reaches Claude with the tool's result", async () => {
   const runtime = new FakeRuntime();
   const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve() });
@@ -1888,4 +1995,17 @@ test("a developer or system message that arrives while a tool runs reaches Claud
   assert.equal(runtime.resolved.length, 1, "the parked call resumes");
   const delivered = runtime.resolved[0].result.content.map(block => block.text ?? "").join("\n");
   assert.match(delivered, /NOTICE-SANDBOX-READ-ONLY/, "the notice must reach Claude, not be marked delivered and dropped");
+});
+
+test("an image DSH offloaded to fit its limits is named as omitted, and its bytes are not read", async () => {
+  const runtime = new FakeRuntime();
+  const attachments = fakeAttachments();
+  const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve(), resolveAttachments: () => attachments });
+  const agent = fakeAgent();
+  adapter.attachAgent(agent);
+  const offloaded = { role: "user", source: { kind: "user" }, content: [{ ...shotBlock, offloaded: true }] };
+  await collect(adapter.stream({ provider: "claude", model: "sonnet", sessionId: agent.id, messages: [offloaded] }));
+  assert.match(runtime.sent[0].message.text, /\[image omitted to fit request image limits: shot\.png\]/);
+  assert.equal(runtime.sent[0].message.images, undefined);
+  assert.equal(attachments.reads.length, 0, "DSH chose not to send these bytes, so none are read");
 });

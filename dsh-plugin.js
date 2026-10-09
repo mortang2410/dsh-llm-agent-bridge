@@ -54,8 +54,16 @@ export function createDshClaudePlugin(ctx, config = {}) {
       // This only reads, synchronously, so the operator sees the posture in
       // the log before the first turn is refused or shuts the exporter down.
       reportTelemetryPosture(telemetry, config.telemetry, ctx.logger);
+      // Image bytes come from the host's attachment service. It is optional, as `connection` is: without it,
+      // an image is named in the text instead of being sent, and the message is still delivered.
+      let attachments;
+      const attachmentFiber = ctx.inject(["attachments"], (scoped) => {
+        attachments = scoped.get("attachments");
+      });
+      defer(() => attachmentFiber?.dispose?.());
       const adapter = new ClaudeDshAdapter({
         runtime, ready: runtime.whenReady(), telemetry,
+        resolveAttachments: () => attachments,
         thinkingSummaries: config.thinkingSummaries,
         linkStore: new ClaudeLinkStore(resolveLinkPath(config.linkPath)), logger: ctx.logger,
       });

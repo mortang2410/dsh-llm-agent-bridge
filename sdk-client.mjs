@@ -322,7 +322,7 @@ export class ClaudeSdkClient extends EventEmitter {
     const turnId = randomUUID();
     const abortController = new AbortController();
     const options = this.queryOptions(session, message, abortController, turnId);
-    const query = this.sdk.query({ prompt: message.text, options });
+    const query = this.sdk.query({ prompt: promptFor(message), options });
     this.queries.set(turnId, { query, abortController, sessionId });
     void this.consumeQuery(session, turnId, query).catch((error) => {
       this.emit("diagnostic", `Claude SDK query failed: ${error?.stack ?? error}`);
@@ -544,6 +544,23 @@ function jsonSchemaShape(schema) {
     }
     return [name, required.has(name) ? field : field.optional()];
   }));
+}
+
+/**
+ * The SDK prompt for one message. Text alone stays a plain string. With images, the prompt is
+ * one user message: the text, then one base64 image block per image.
+ */
+export function promptFor(message) {
+  const images = Array.isArray(message.images) ? message.images : [];
+  if (images.length === 0) return message.text;
+  const content = [];
+  if (message.text) content.push({ type: "text", text: message.text });
+  for (const image of images) {
+    content.push({ type: "image", source: { type: "base64", media_type: image.mediaType, data: image.data } });
+  }
+  return (async function* () {
+    yield { type: "user", message: { role: "user", content }, parent_tool_use_id: null };
+  })();
 }
 
 export function dshToolResult(result) {
