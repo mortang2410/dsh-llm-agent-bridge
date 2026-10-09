@@ -289,6 +289,11 @@ export class ClaudeDshAdapter extends LlmAdapter {
     const instruction = latestUserIndex(options.messages);
     if (instruction === -1) throw new Error("The Claude adapter received no user text");
     const input = await this.prepareInput(options.messages[instruction], options.signal);
+    // A stop during an image read ends the turn before anything is sent, as a stop during a turn does.
+    if (options.signal?.aborted) {
+      yield { type: "finish", reason: { kind: "aborted", failure: { message: "Claude turn cancelled", code: "ABORTED" } } };
+      return;
+    }
     if (!input.text && input.images.length === 0) throw new Error("The Claude adapter received no user text");
     const nativePermissions = permissionConfiguration(sessionEventLog(agent.session));
     const config = this.configure(sessionId, {
@@ -530,6 +535,7 @@ export class ClaudeDshAdapter extends LlmAdapter {
   async prepareInput(message, signal) {
     const parts = [];
     const images = [];
+    let encoded = 0;
     for (const block of message?.content ?? []) {
       if (block?.type === "text") parts.push(block.text);
       if (block?.type !== "image") continue;
@@ -539,7 +545,10 @@ export class ClaudeDshAdapter extends LlmAdapter {
         continue;
       }
       const image = await this.readImage(block, signal);
-      if (image) {
+      if (image && encoded + image.data.length > IMAGE_BYTES_PER_MESSAGE) {
+        parts.push(`[image omitted to fit request image limits: ${image.name}]`);
+      } else if (image) {
+        encoded += image.data.length;
         images.push(image);
         parts.push(`[image: ${image.name}]`);
       } else {
@@ -1352,6 +1361,8 @@ function resultText(result) {
 const IMAGE_MAX_EDGE = 4096;
 /** Encoded-byte target per image. The API limits the base64 text to 5 MB, and base64 is a third larger than the bytes. */
 const IMAGE_MAX_BYTES = 3_750_000;
+/** Base64 text one message may carry in images. A request is capped at 32 MB, so images past this are omitted. */
+const IMAGE_BYTES_PER_MESSAGE = 15_000_000;
 
 /** The size an image is requested at: its longest edge capped, and the byte target. */
 function imageRequestTarget(ref) {
