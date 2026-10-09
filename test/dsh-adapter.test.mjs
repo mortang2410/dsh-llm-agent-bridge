@@ -533,7 +533,10 @@ test("a stale completion of an abandoned turn does not drop the replacement turn
   runtime.emit("activity", { method: "turn/completed", params: { sessionId: claudeSession, turn: { id: "turn-1", status: "interrupted", error: null, items: [] } } });
   // ...and then the replacement parks its call.
   runtime.emit("activity", notification("tool/parked", claudeSession, "turn-2", { parkId: "park-2", name: "bash", arguments: { command: "date" } }));
-  const outcome = await Promise.race([replacement, new Promise(resolve => setTimeout(() => resolve({ timedOut: true }), 2000))]);
+  let limitTimer;
+  const limit = new Promise(resolve => { limitTimer = setTimeout(() => resolve({ timedOut: true }), 2000); });
+  const outcome = await Promise.race([replacement, limit]);
+  clearTimeout(limitTimer);
   assert.ok(!outcome.timedOut, "the replacement turn must park or finish, not wait forever");
   assert.ifError(outcome.error);
   assert.equal(outcome.chunks.at(-1).reason.kind, "tool-calls", "the replacement must park");
