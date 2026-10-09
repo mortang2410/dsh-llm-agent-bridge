@@ -261,6 +261,12 @@ export class ClaudeDshAdapter extends LlmAdapter {
         // Messages DSH received while the tool ran ride on its result: a running Claude
         // query cannot take a new user message.
         const inputs = await this.prepareInputs(this.undeliveredInput(sessionId, options.messages), options.signal);
+        // A stop during an image read ends the turn before its tool result reaches Claude, as a stop before a first send does.
+        if (options.signal?.aborted) {
+          await this.abandonTurn(sessionId, suspended);
+          yield { type: "finish", reason: { kind: "aborted", failure: { message: "Claude turn cancelled", code: "ABORTED" } } };
+          return;
+        }
         debugLog("resume", { sessionId, turnId: suspended.turnId, resolving: results.map(result => result.toolCallId), inputs: inputs.length });
         this.markBuilt(sessionId, agent);
         const deliveredBefore = this.seen.get(String(sessionId));

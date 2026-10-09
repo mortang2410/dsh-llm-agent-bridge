@@ -1936,6 +1936,42 @@ test("an image sent while a tool runs reaches Claude on the tool's result, and i
   assert.equal(runtime.sent[1].message.images, undefined, "the image was delivered once, so the next turn does not carry it again");
 });
 
+test("a stop during an image read on a tool result ends the turn, and the tool result never reaches Claude", async () => {
+  const runtime = new FakeRuntime();
+  // Each read takes 200 ms and rejects when the signal aborts, as the attachment service does.
+  const slowAttachments = {
+    readImageRequest(ref, target, signal) {
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => resolve({
+          variantId: "v1", attachment: ref, data: PNG_BYTES, mediaType: ref.mediaType,
+          bytes: PNG_BYTES.length, width: target.width, height: target.height,
+        }), 200);
+        signal?.addEventListener("abort", () => { clearTimeout(timer); reject(new Error("aborted")); });
+      });
+    },
+  };
+  const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve(), resolveAttachments: () => slowAttachments });
+  const agent = fakeAgent();
+  adapter.attachAgent(agent);
+  agent.session.append("turn/start", { turn: 1 });
+  const go = { role: "user", source: { kind: "user" }, content: [{ type: "text", text: "go" }] };
+  const first = await collect(adapter.stream({ provider: "claude", model: "sonnet", sessionId: agent.id, messages: [go], tools: bashTool }));
+  const call = first.find(chunk => chunk.type === "block-end" && chunk.block.type === "tool-call").block;
+  const result = {
+    role: "tool", source: { kind: "tool", callId: call.id }, toolCallId: call.id,
+    content: [{ type: "text", text: "/workspace/dsh" }], isError: false,
+  };
+  const steer = { role: "user", source: { kind: "user" }, content: [shotBlock] };
+  const controller = new AbortController();
+  setTimeout(() => controller.abort(), 20);
+  const second = await collect(adapter.stream({
+    provider: "claude", model: "sonnet", sessionId: agent.id, messages: [go, result, steer], tools: bashTool, signal: controller.signal,
+  }));
+  assert.equal(second.at(-1).reason.kind, "aborted", "the stopped turn finishes as aborted");
+  assert.equal(runtime.resolved.length, 0, "the tool result is not handed to Claude");
+  assert.deepEqual(runtime.interrupted.map(entry => entry.turnId), ["turn-1"], "the parked Claude turn is interrupted, not left waiting");
+});
+
 test("an image that cannot be read is named in the text, and its message is still delivered once", async () => {
   const runtime = new FakeRuntime();
   const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve(), resolveAttachments: () => fakeAttachments({ fail: true }) });
