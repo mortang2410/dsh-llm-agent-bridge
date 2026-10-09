@@ -503,6 +503,64 @@ test("aborting a turn while its tool call is parked fails only that turn's parke
   assert.deepEqual(runtime.interrupted, [{ sessionId: runtime.sent[0].sessionId, turnId: "turn-1" }], "the aborted turn is interrupted");
 });
 
+test("a stale completion of an abandoned turn does not drop the replacement turn's waiting call", async () => {
+  const runtime = new ManualParkRuntime();
+  const rejected = [];
+  runtime.rejectToolCall = (parkId) => { rejected.push(parkId); return true; };
+  const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve() });
+  const agent = fakeAgent();
+  adapter.attachAgent(agent);
+  const request = (text, tools) => ({
+    provider: "claude", model: "sonnet", sessionId: agent.id,
+    messages: [{ role: "user", source: { kind: "user" }, content: [{ type: "text", text }] }],
+    tools,
+  });
+
+  const first = await collect(adapter.stream(request("go", bashTool)));
+  assert.equal(first.at(-1).reason.kind, "tool-calls", "the first turn must park");
+  const claudeSession = runtime.sent[0].sessionId;
+
+  // The user sends a new message, so the parked turn is replaced. The replacement parks later.
+  runtime.autoPark = false;
+  const replacement = collect(adapter.stream(request("go again", bashTool)));
+  while (runtime.sent.length < 2) await new Promise(resolve => setImmediate(resolve));
+  // The interrupted first turn reports its end only after the replacement has started...
+  runtime.emit("activity", { method: "turn/completed", params: { sessionId: claudeSession, turn: { id: "turn-1", status: "interrupted", error: null, items: [] } } });
+  // ...and then the replacement parks its call.
+  runtime.emit("activity", notification("tool/parked", claudeSession, "turn-2", { parkId: "park-2", name: "bash", arguments: { command: "date" } }));
+  const second = await replacement;
+  assert.equal(second.at(-1).reason.kind, "tool-calls", "the replacement must park");
+
+  await collect(adapter.stream(request("never mind", undefined)));
+  assert.deepEqual(rejected, ["park-1", "park-2"], "the replacement's waiting call is failed when the replacement is replaced");
+});
+
+test("replacing one chat's parked turn fails only that chat's waiting call, while another chat's call is still waiting", async () => {
+  const runtime = new ManualParkRuntime();
+  const rejected = [];
+  let rejectedAll = 0;
+  runtime.rejectToolCall = (parkId) => { rejected.push(parkId); return true; };
+  runtime.rejectAllToolCalls = () => { rejectedAll += 1; };
+  const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve() });
+  const chatA = fakeAgent();
+  const chatB = { ...fakeAgent(), id: "dsh-2" };
+  adapter.attachAgent(chatA);
+  adapter.attachAgent(chatB);
+  const ask = (agent, text, tools) => collect(adapter.stream({
+    provider: "claude", model: "sonnet", sessionId: agent.id,
+    messages: [{ role: "user", source: { kind: "user" }, content: [{ type: "text", text }] }],
+    tools,
+  }));
+
+  assert.equal((await ask(chatA, "go A", bashTool)).at(-1).reason.kind, "tool-calls");
+  assert.equal((await ask(chatB, "go B", bashTool)).at(-1).reason.kind, "tool-calls", "chat B must be parked too");
+  await ask(chatA, "never mind", undefined);
+
+  assert.equal(rejectedAll, 0, "the broad cancel would also fail chat B's waiting call");
+  assert.deepEqual(rejected, ["park-1"], "only chat A's waiting call is failed");
+  assert.deepEqual(runtime.interrupted, [{ sessionId: runtime.sent[0].sessionId, turnId: "turn-1" }], "only chat A's turn is interrupted");
+});
+
 test("a plain follow-up keeps the Claude session, and rewriting only the system prompt does not reset it", async () => {
   const runtime = new FakeRuntime();
   const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve() });
@@ -1033,6 +1091,28 @@ class SilentCallRuntime extends FakeRuntime {
         parkId: "park-1", name: message.dshTools[0].name, arguments: { command: "pwd" },
       }));
     });
+    return { id: turnId, status: "inProgress", items: [] };
+  }
+}
+
+/** Parks one call per turn, as FakeRuntime does, unless autoPark is cleared so a test places the park itself. */
+class ManualParkRuntime extends FakeRuntime {
+  constructor() {
+    super();
+    this.autoPark = true;
+  }
+
+  async sendMessage(sessionId, message) {
+    this.sent.push({ sessionId, message });
+    const turnId = `turn-${this.sent.length}`;
+    const hasTools = Boolean(message.dshTools?.length);
+    if (!hasTools) {
+      queueMicrotask(() => this.finishTurn(sessionId, turnId));
+    } else if (this.autoPark) {
+      queueMicrotask(() => this.emit("activity", notification("tool/parked", sessionId, turnId, {
+        parkId: `park-${this.sent.length}`, name: "bash", arguments: { command: "pwd" },
+      })));
+    }
     return { id: turnId, status: "inProgress", items: [] };
   }
 }

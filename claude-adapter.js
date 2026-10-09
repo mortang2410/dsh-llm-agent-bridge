@@ -38,8 +38,9 @@ export class ClaudeDshAdapter extends LlmAdapter {
     this.readers = new Set();
     // Turns that have finished; a late report for one of them is never recorded.
     this.finishedTurns = new Set();
-    // Waiting tool calls and usage are recorded for the life of each owned turn, including the gap
-    // while a parked step waits for DSH to run its tools, so neither is lost to that gap.
+    // Waiting tool calls are recorded for each linked Claude session, and usage for each owned turn.
+    // Both are recorded for the life of the adapter, including the gap while a parked step waits
+    // for DSH to run its tools, so neither is lost to that gap.
     this.waitingCalls = new Map();
     this.activityUnsubscribe = null;
     if (runtime && (typeof runtime.subscribeActivity === "function" || typeof runtime.on === "function")) {
@@ -412,11 +413,12 @@ export class ClaudeDshAdapter extends LlmAdapter {
     }
   }
 
-  /** Remember a tool call that an owned Claude session announced, until its result is delivered or it is failed. */
+  /** Remember a tool call that a linked Claude session announced, until its result is delivered or it is failed. */
   recordWaitingCall(message) {
     if (!isToolParked(message)) return;
     const { sessionId, parkId } = message.params;
-    if (!this.ownedSessions.has(sessionId)) return;
+    // Linked, not owned: a stale completion of an abandoned turn clears ownership while its replacement still waits.
+    if (!this.dshSessionForClaudeSession(sessionId)) return;
     if (!this.waitingCalls.has(sessionId)) this.waitingCalls.set(sessionId, new Set());
     this.waitingCalls.get(sessionId).add(parkId);
   }
