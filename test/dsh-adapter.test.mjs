@@ -443,6 +443,56 @@ test("a compaction while a Claude turn waits on a tool result fails only that pa
   assert.equal(second.at(-1).reason.kind, "stop");
 });
 
+test("a user message that replaces a parked turn fails only that turn's parked call, never another chat's", async () => {
+  const runtime = new FakeRuntime();
+  const rejected = [];
+  let rejectedAll = 0;
+  runtime.rejectToolCall = (parkId) => { rejected.push(parkId); return true; };
+  runtime.rejectAllToolCalls = () => { rejectedAll += 1; };
+  const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve() });
+  const agent = fakeAgent();
+  adapter.attachAgent(agent);
+
+  const first = await collect(adapter.stream({
+    provider: "claude", model: "sonnet", sessionId: agent.id,
+    messages: [{ role: "user", source: { kind: "user" }, content: [{ type: "text", text: "go" }] }],
+    tools: bashTool,
+  }));
+  assert.equal(first.at(-1).reason.kind, "tool-calls", "the first request must park on a tool call");
+
+  // The user types a new message instead of answering the parked tool call.
+  await collect(adapter.stream({
+    provider: "claude", model: "sonnet", sessionId: agent.id,
+    messages: [{ role: "user", source: { kind: "user" }, content: [{ type: "text", text: "never mind" }] }],
+  }));
+
+  assert.equal(rejectedAll, 0, "the broad cancel would also fail parked calls of other DSH chats");
+  assert.deepEqual(rejected, ["park-1"], "only this turn's parked call is failed");
+});
+
+test("aborting a turn while its tool call is parked fails only that turn's parked call, never another chat's", async () => {
+  const runtime = new SilentCallRuntime();
+  const rejected = [];
+  let rejectedAll = 0;
+  runtime.rejectToolCall = (parkId) => { rejected.push(parkId); return true; };
+  runtime.rejectAllToolCalls = () => { rejectedAll += 1; };
+  const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve() });
+  const agent = fakeAgent();
+  adapter.attachAgent(agent);
+  const controller = new AbortController();
+  setTimeout(() => controller.abort(), 50);
+  const chunks = await collect(adapter.stream({
+    provider: "claude", model: "sonnet", sessionId: agent.id,
+    signal: controller.signal,
+    messages: [{ role: "user", source: { kind: "user" }, content: [{ type: "text", text: "go" }] }],
+    tools: bashTool,
+  }));
+
+  assert.equal(chunks.at(-1).reason.kind, "aborted");
+  assert.equal(rejectedAll, 0, "the broad cancel would also fail parked calls of other DSH chats");
+  assert.deepEqual(rejected, ["park-1"], "only this turn's parked call is failed");
+});
+
 test("a plain follow-up keeps the Claude session, and rewriting only the system prompt does not reset it", async () => {
   const runtime = new FakeRuntime();
   const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve() });

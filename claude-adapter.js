@@ -302,9 +302,13 @@ export class ClaudeDshAdapter extends LlmAdapter {
    */
   async *runTurn(agent, sessionId, claudeSessionId, options, start, { firstEventTimeoutMs = 0, knownTurnId = null } = {}) {
     const queue = new ActivityQueue(options.signal, "Claude");
+    // The park ids this Claude session announced during this call, so an abort fails exactly those.
+    const parkIds = new Set();
     const onActivity = (message) => {
       const candidate = message.params?.sessionId ?? message.params?.session?.id;
-      if (candidate === claudeSessionId && !String(message.method).startsWith("usage/")) queue.push(message);
+      if (candidate !== claudeSessionId) return;
+      if (isToolParked(message)) parkIds.add(message.params.parkId);
+      if (!String(message.method).startsWith("usage/")) queue.push(message);
     };
     // Subscribe before starting or resuming: a runtime that emits synchronously
     // would otherwise deliver the whole turn before anyone is listening.
@@ -390,7 +394,7 @@ export class ClaudeDshAdapter extends LlmAdapter {
       this.releaseTurn(claudeSessionId, turnId);
       debugLog("turn/error", { sessionId, turnId, aborted: Boolean(options.signal?.aborted), message: String(error?.message ?? error) });
       if (options.signal?.aborted) {
-        if (turnId) await this.abandonTurn(sessionId, { claudeSessionId, turnId });
+        if (turnId) await this.abandonTurn(sessionId, { claudeSessionId, turnId, calls: [...parkIds] });
         yield { type: "finish", reason: { kind: "aborted", failure: { message: "Claude turn cancelled", code: "ABORTED" } } };
         return;
       }
@@ -416,11 +420,16 @@ export class ClaudeDshAdapter extends LlmAdapter {
     this.readers.delete(claudeSessionId);
   }
 
-  /** Release a Claude turn nobody is going to finish, and unpark its tool calls. */
-  async abandonTurn(sessionId, { claudeSessionId, turnId }) {
+  /**
+   * Release a Claude turn nobody is going to finish, and fail its parked tool calls.
+   * Only the calls this turn parked are failed: rejectAllToolCalls would also fail
+   * parked calls of other DSH sessions sharing the runtime.
+   */
+  async abandonTurn(sessionId, { claudeSessionId, turnId, calls = [] }) {
     this.suspended.delete(sessionId);
     this.releaseTurn(claudeSessionId, turnId);
-    this.runtime.rejectAllToolCalls?.(new Error("The DSH turn was abandoned before the tool result arrived"));
+    const error = new Error("The DSH turn was abandoned before the tool result arrived");
+    for (const call of calls) this.runtime.rejectToolCall?.(call, error);
     if (turnId) await this.runtime.interruptTurn(claudeSessionId, turnId).catch(() => {});
   }
 
