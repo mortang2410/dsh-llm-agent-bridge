@@ -672,6 +672,8 @@ export class ClaudeDshAdapter extends LlmAdapter {
         continue;
       }
       if (message.method === "turn/completed") {
+        // A completion of another turn is a late report from an interrupted query. It does not end this step.
+        if (message.params?.turn?.id !== turnId) continue;
         // A parked turn cannot complete before its tool results arrive.
         queue.unshift(message);
         break;

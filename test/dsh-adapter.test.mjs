@@ -636,6 +636,35 @@ test("a late completion of a stopped turn does not stop the replacement turn's u
   assert.equal(usage[0].inputTokens, 200, "the second model call's prompt is counted");
 });
 
+test("a stale completion of another turn does not cut a replacement step short while it settles", async () => {
+  const runtime = new StaleCompletionDuringSettleRuntime();
+  const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve() });
+  const agent = fakeAgent();
+  adapter.attachAgent(agent);
+  agent.session.append("turn/start", { turn: 1 });
+  const go = { role: "user", source: { kind: "user" }, content: [{ type: "text", text: "go" }] };
+  const first = await collect(adapter.stream({
+    provider: "claude", model: "sonnet", sessionId: agent.id, messages: [go], tools: bashTool,
+  }));
+  const call = first.find(chunk => chunk.type === "block-end" && chunk.block.type === "tool-call").block;
+
+  // DSH stops turn 1 mid-tool; the user's next message starts turn 2, whose step parks two calls.
+  agent.session.append("turn/end", { turn: 1, reason: { kind: "aborted", reason: { kind: "user" } } });
+  agent.session.append("turn/start", { turn: 2 });
+  const cutShort = {
+    role: "tool", source: { kind: "tool", callId: call.id }, toolCallId: call.id,
+    content: [{ type: "text", text: "Error: tool call aborted" }], isError: true,
+  };
+  const next = { role: "user", source: { kind: "user" }, content: [{ type: "text", text: "never mind, check the logs" }] };
+  const second = await collect(adapter.stream({
+    provider: "claude", model: "sonnet", sessionId: agent.id, messages: [go, cutShort, next], tools: bashTool,
+  }));
+
+  const parked = second.filter(chunk => chunk.type === "block-end" && chunk.block.type === "tool-call").map(chunk => chunk.block.id);
+  assert.deepEqual(parked, ["park-a", "park-b"], "both calls of the replacement step land in one batch");
+  assert.equal(second.at(-1).reason.kind, "tool-calls");
+});
+
 test("a message whose turn ends failed is offered again on the next turn", async () => {
   const runtime = new FailingFirstTurnRuntime();
   const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve() });
@@ -1261,6 +1290,29 @@ class FailingFirstTurnRuntime extends FakeRuntime {
       id: "turn-1", status: "failed", error: { message: "upstream error" }, items: [], usage: {},
     } } }));
     return { id: "turn-1", status: "inProgress", items: [] };
+  }
+}
+
+/**
+ * The first turn parks on one call. The replacement turn's model call declares two tool calls,
+ * and the stopped turn's completion, a late report from an interrupted query, lands between their parks.
+ */
+class StaleCompletionDuringSettleRuntime extends FakeRuntime {
+  async sendMessage(sessionId, message) {
+    this.sent.push({ sessionId, message });
+    const turnId = `turn-${this.sent.length}`;
+    queueMicrotask(() => {
+      if (this.sent.length === 1) {
+        this.parked = { sessionId, turnId };
+        this.emit("activity", notification("tool/parked", sessionId, turnId, { parkId: "park-1", name: "bash", arguments: { command: "pwd" } }));
+        return;
+      }
+      this.emit("activity", notification("usage/toolUses", sessionId, turnId, { callId: "msg-b", toolUseIds: ["park-a", "park-b"] }));
+      this.emit("activity", notification("tool/parked", sessionId, turnId, { parkId: "park-a", name: "bash", arguments: { command: "pwd" } }));
+      this.emit("activity", { method: "turn/completed", params: { sessionId, turn: { id: "turn-1", status: "interrupted", error: null, items: [], usage: {} } } });
+      this.emit("activity", notification("tool/parked", sessionId, turnId, { parkId: "park-b", name: "bash", arguments: { command: "date" } }));
+    });
+    return { id: turnId, status: "inProgress", items: [] };
   }
 }
 
