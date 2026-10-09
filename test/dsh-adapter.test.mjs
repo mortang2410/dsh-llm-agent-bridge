@@ -460,6 +460,12 @@ test("a user message that replaces a parked turn fails only that turn's parked c
   }));
   assert.equal(first.at(-1).reason.kind, "tool-calls", "the first request must park on a tool call");
 
+  const claudeSession = runtime.sent[0].sessionId;
+  // Claude announces a second call after the handoff, while DSH holds the turn. It is still this turn's.
+  runtime.emit("activity", notification("tool/parked", claudeSession, "turn-1", { parkId: "late-park", name: "bash", arguments: { command: "date" } }));
+  // A waiting call of another chat on the same runtime must survive.
+  runtime.emit("activity", notification("tool/parked", "other-claude-session", "turn-9", { parkId: "other-park", name: "bash", arguments: { command: "ls" } }));
+
   // The user types a new message instead of answering the parked tool call.
   await collect(adapter.stream({
     provider: "claude", model: "sonnet", sessionId: agent.id,
@@ -467,7 +473,8 @@ test("a user message that replaces a parked turn fails only that turn's parked c
   }));
 
   assert.equal(rejectedAll, 0, "the broad cancel would also fail parked calls of other DSH chats");
-  assert.deepEqual(rejected, ["park-1"], "only this turn's parked call is failed");
+  assert.deepEqual(rejected, ["park-1", "late-park"], "this turn's waiting calls are failed, and no other chat's");
+  assert.deepEqual(runtime.interrupted, [{ sessionId: claudeSession, turnId: "turn-1" }], "the abandoned turn is interrupted");
 });
 
 test("aborting a turn while its tool call is parked fails only that turn's parked call, never another chat's", async () => {
@@ -480,6 +487,8 @@ test("aborting a turn while its tool call is parked fails only that turn's parke
   const agent = fakeAgent();
   adapter.attachAgent(agent);
   const controller = new AbortController();
+  // Another chat parks a call while this turn is still waiting on its usage.
+  setTimeout(() => runtime.emit("activity", notification("tool/parked", "other-claude-session", "turn-9", { parkId: "other-park", name: "bash", arguments: { command: "ls" } })), 20);
   setTimeout(() => controller.abort(), 50);
   const chunks = await collect(adapter.stream({
     provider: "claude", model: "sonnet", sessionId: agent.id,
@@ -490,7 +499,8 @@ test("aborting a turn while its tool call is parked fails only that turn's parke
 
   assert.equal(chunks.at(-1).reason.kind, "aborted");
   assert.equal(rejectedAll, 0, "the broad cancel would also fail parked calls of other DSH chats");
-  assert.deepEqual(rejected, ["park-1"], "only this turn's parked call is failed");
+  assert.deepEqual(rejected, ["park-1"], "only this turn's parked call is failed, not the other chat's");
+  assert.deepEqual(runtime.interrupted, [{ sessionId: runtime.sent[0].sessionId, turnId: "turn-1" }], "the aborted turn is interrupted");
 });
 
 test("a plain follow-up keeps the Claude session, and rewriting only the system prompt does not reset it", async () => {

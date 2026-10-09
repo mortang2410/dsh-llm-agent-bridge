@@ -38,14 +38,18 @@ export class ClaudeDshAdapter extends LlmAdapter {
     this.readers = new Set();
     // Turns that have finished; a late report for one of them is never recorded.
     this.finishedTurns = new Set();
-    // Usage is recorded for the life of each owned turn, including the gap while a
-    // parked step waits for DSH to run its tools, so no report is lost to that gap.
-    this.usageUnsubscribe = null;
+    // Waiting tool calls and usage are recorded for the life of each owned turn, including the gap
+    // while a parked step waits for DSH to run its tools, so neither is lost to that gap.
+    this.waitingCalls = new Map();
+    this.activityUnsubscribe = null;
     if (runtime && (typeof runtime.subscribeActivity === "function" || typeof runtime.on === "function")) {
       try {
-        this.usageUnsubscribe = subscribeRuntimeActivity(runtime, message => this.recordUsageActivity(message));
+        this.activityUnsubscribe = subscribeRuntimeActivity(runtime, message => {
+          this.recordWaitingCall(message);
+          this.recordUsageActivity(message);
+        });
       } catch (error) {
-        this.logger?.warn?.(`Claude usage reporting is unavailable: ${error?.message ?? error}`);
+        this.logger?.warn?.(`Claude usage and waiting-call reporting is unavailable: ${error?.message ?? error}`);
       }
     }
     for (const [sessionId, record] of linkStore?.entries() ?? []) {
@@ -59,10 +63,11 @@ export class ClaudeDshAdapter extends LlmAdapter {
 
   /** Stop recording usage from the runtime, and forget every ledger and owned session. */
   dispose() {
-    this.usageUnsubscribe?.();
-    this.usageUnsubscribe = null;
+    this.activityUnsubscribe?.();
+    this.activityUnsubscribe = null;
     this.usageLedgers.clear();
     this.ownedSessions.clear();
+    this.waitingCalls.clear();
     this.readers.clear();
     this.finishedTurns.clear();
   }
@@ -253,6 +258,7 @@ export class ClaudeDshAdapter extends LlmAdapter {
           for (const result of results) {
             const delivered = this.runtime.resolveToolCall(result.toolCallId, dshToolResult(result));
             debugLog("resolve", { toolCallId: result.toolCallId, delivered });
+            if (delivered) this.waitingCalls.get(suspended.claudeSessionId)?.delete(result.toolCallId);
             if (!delivered) {
               // Nothing is waiting on this id, so nothing will ever wake the
               // turn. Fail now rather than stalling for the user to notice.
@@ -302,13 +308,9 @@ export class ClaudeDshAdapter extends LlmAdapter {
    */
   async *runTurn(agent, sessionId, claudeSessionId, options, start, { firstEventTimeoutMs = 0, knownTurnId = null } = {}) {
     const queue = new ActivityQueue(options.signal, "Claude");
-    // The park ids this Claude session announced during this call, so an abort fails exactly those.
-    const parkIds = new Set();
     const onActivity = (message) => {
       const candidate = message.params?.sessionId ?? message.params?.session?.id;
-      if (candidate !== claudeSessionId) return;
-      if (isToolParked(message)) parkIds.add(message.params.parkId);
-      if (!String(message.method).startsWith("usage/")) queue.push(message);
+      if (candidate === claudeSessionId && !String(message.method).startsWith("usage/")) queue.push(message);
     };
     // Subscribe before starting or resuming: a runtime that emits synchronously
     // would otherwise deliver the whole turn before anyone is listening.
@@ -394,7 +396,7 @@ export class ClaudeDshAdapter extends LlmAdapter {
       this.releaseTurn(claudeSessionId, turnId);
       debugLog("turn/error", { sessionId, turnId, aborted: Boolean(options.signal?.aborted), message: String(error?.message ?? error) });
       if (options.signal?.aborted) {
-        if (turnId) await this.abandonTurn(sessionId, { claudeSessionId, turnId, calls: [...parkIds] });
+        if (turnId) await this.abandonTurn(sessionId, { claudeSessionId, turnId });
         yield { type: "finish", reason: { kind: "aborted", failure: { message: "Claude turn cancelled", code: "ABORTED" } } };
         return;
       }
@@ -410,6 +412,22 @@ export class ClaudeDshAdapter extends LlmAdapter {
     }
   }
 
+  /** Remember a tool call that an owned Claude session announced, until its result is delivered or it is failed. */
+  recordWaitingCall(message) {
+    if (!isToolParked(message)) return;
+    const { sessionId, parkId } = message.params;
+    if (!this.ownedSessions.has(sessionId)) return;
+    if (!this.waitingCalls.has(sessionId)) this.waitingCalls.set(sessionId, new Set());
+    this.waitingCalls.get(sessionId).add(parkId);
+  }
+
+  /** Forget and return the tool calls a Claude session is still waiting on. */
+  takeWaitingCalls(claudeSessionId) {
+    const calls = [...(this.waitingCalls.get(claudeSessionId) ?? [])];
+    this.waitingCalls.delete(claudeSessionId);
+    return calls;
+  }
+
   /** Forget a turn's ledger and its Claude session, once nothing more will report usage for them. */
   releaseTurn(claudeSessionId, turnId) {
     this.rememberFinished(turnId);
@@ -421,15 +439,15 @@ export class ClaudeDshAdapter extends LlmAdapter {
   }
 
   /**
-   * Release a Claude turn nobody is going to finish, and fail its parked tool calls.
-   * Only the calls this turn parked are failed: rejectAllToolCalls would also fail
-   * parked calls of other DSH sessions sharing the runtime.
+   * Release a Claude turn nobody is going to finish, and fail the tool calls its Claude
+   * session is still waiting on. Only that session's calls are failed: rejectAllToolCalls
+   * would also fail the calls of other DSH sessions sharing the runtime.
    */
-  async abandonTurn(sessionId, { claudeSessionId, turnId, calls = [] }) {
+  async abandonTurn(sessionId, { claudeSessionId, turnId }) {
     this.suspended.delete(sessionId);
     this.releaseTurn(claudeSessionId, turnId);
     const error = new Error("The DSH turn was abandoned before the tool result arrived");
-    for (const call of calls) this.runtime.rejectToolCall?.(call, error);
+    for (const call of this.takeWaitingCalls(claudeSessionId)) this.runtime.rejectToolCall?.(call, error);
     if (turnId) await this.runtime.interruptTurn(claudeSessionId, turnId).catch(() => {});
   }
 
@@ -479,15 +497,15 @@ export class ClaudeDshAdapter extends LlmAdapter {
   }
 
   /**
-   * Release a parked turn whose transcript DSH has rewritten. Only this turn's parked
-   * calls are failed: rejectAllToolCalls would also fail parked calls of other DSH
-   * sessions sharing the runtime.
+   * Release a parked turn whose transcript DSH has rewritten. Only the calls its Claude
+   * session is still waiting on are failed: rejectAllToolCalls would also fail the calls
+   * of other DSH sessions sharing the runtime.
    */
-  async releaseParkedTurn(sessionId, { claudeSessionId, turnId, calls }) {
+  async releaseParkedTurn(sessionId, { claudeSessionId, turnId }) {
     this.suspended.delete(sessionId);
     this.releaseTurn(claudeSessionId, turnId);
     const error = new Error("DSH rewrote its history while the turn was waiting for a tool result");
-    for (const call of calls) this.runtime.rejectToolCall?.(call, error);
+    for (const call of this.takeWaitingCalls(claudeSessionId)) this.runtime.rejectToolCall?.(call, error);
     if (turnId) await this.runtime.interruptTurn(claudeSessionId, turnId).catch(() => {});
   }
 
