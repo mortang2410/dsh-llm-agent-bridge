@@ -257,8 +257,8 @@ export class ClaudeDshAdapter extends LlmAdapter {
       // the stopped query would hand Claude the cut-short result and drop that message.
       const superseded = turnStartedSince(agent, suspended.dshSeq);
       if (results.length && !superseded) {
-        // Input typed while the tool ran rides on its result: a running Claude query
-        // cannot take a new user message.
+        // Messages DSH received while the tool ran ride on its result: a running Claude
+        // query cannot take a new user message.
         const inputs = this.undeliveredInput(sessionId, options.messages);
         debugLog("resume", { sessionId, turnId: suspended.turnId, resolving: results.map(result => result.toolCallId), inputs: inputs.length });
         this.markBuilt(sessionId, agent);
@@ -493,7 +493,7 @@ export class ClaudeDshAdapter extends LlmAdapter {
 
   /**
    * DSH messages past the delivered position that carry text and are not tool
-   * results: the input the user typed while a tool was running.
+   * results: what the user typed, and any DSH context added, while a tool was running.
    */
   undeliveredInput(sessionId, messages) {
     const delivered = this.seen.get(String(sessionId)) ?? 0;
@@ -1131,20 +1131,30 @@ function turnStartedSince(agent, seq) {
   return sessionEventLog(agent.session).some(event => event.type === "turn/start" && event.seq > seq);
 }
 
+/** Message sources a person wrote or answered. Any other DSH message is context, not the user's input. */
+const USER_SOURCE_KINDS = new Set(["user", "user-question-reply"]);
+
 /**
- * The results a resumed Claude query receives, with any input typed while the tool
- * ran appended to the last one. The text is delivered once, on that result.
+ * The results a resumed Claude query receives, with the messages DSH received while the
+ * tool ran appended to the last one. The user's own input is labelled as input; a DSH
+ * message, such as a runtime-context snapshot, is labelled as context so Claude does not
+ * read it as the user's words. Each message is delivered once, on that result.
  */
 function resultsWithInput(results, inputs) {
   if (inputs.length === 0 || results.length === 0) return results;
-  const note = inputs.map(message => messageText(message)).join("\n\n");
+  const typed = inputs.filter(message => USER_SOURCE_KINDS.has(message.source?.kind));
+  const context = inputs.filter(message => !USER_SOURCE_KINDS.has(message.source?.kind));
+  const notes = [
+    typed.length > 0 && `Input received while this tool ran:\n\n${typed.map(message => messageText(message)).join("\n\n")}`,
+    context.length > 0 && `Context received while this tool ran:\n\n${context.map(message => messageText(message)).join("\n\n")}`,
+  ].filter(Boolean);
   const last = results.length - 1;
   return results.map((result, index) => {
     if (index !== last) return result;
     const content = Array.isArray(result.content) ? result.content : [{ type: "text", text: String(result.content ?? "") }];
     return {
       ...result,
-      content: [...content, { type: "text", text: `Input received while this tool ran:\n\n${note}` }],
+      content: [...content, ...notes.map(text => ({ type: "text", text }))],
     };
   });
 }

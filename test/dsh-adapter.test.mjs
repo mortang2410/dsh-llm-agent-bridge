@@ -574,6 +574,37 @@ test("a message sent while a tool runs reaches Claude with that tool's result, a
   assert.equal(runtime.sent[1].message.text, "next", "a delivered steer must not be sent again as context");
 });
 
+test("a DSH message delivered while a tool ran is labelled as context, not as the user's input", async () => {
+  const runtime = new FakeRuntime();
+  const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve() });
+  const agent = fakeAgent();
+  adapter.attachAgent(agent);
+  agent.session.append("turn/start", { turn: 1 });
+  const go = { role: "user", source: { kind: "user" }, content: [{ type: "text", text: "go" }] };
+  const first = await collect(adapter.stream({
+    provider: "claude", model: "sonnet", sessionId: agent.id, messages: [go], tools: bashTool,
+  }));
+  const call = first.find(chunk => chunk.type === "block-end" && chunk.block.type === "tool-call").block;
+
+  // While bash runs, the user types a steer and DSH's runtime-context snapshot changes.
+  // Only the steer is the user's words; the snapshot is DSH's context.
+  const result = {
+    role: "tool", source: { kind: "tool", callId: call.id }, toolCallId: call.id,
+    content: [{ type: "text", text: "/workspace/dsh" }], isError: false,
+  };
+  const steer = { role: "user", source: { kind: "user" }, content: [{ type: "text", text: "also check the audio output" }] };
+  const snapshot = {
+    role: "user", source: { kind: "runtime-context" }, content: [{ type: "text", text: "Current runtime context: cwd /workspace/dsh" }],
+  };
+  await collect(adapter.stream({
+    provider: "claude", model: "sonnet", sessionId: agent.id, messages: [go, result, steer, snapshot], tools: bashTool,
+  }));
+
+  const delivered = runtime.resolved[0].result.content.map(block => block.text).join("\n");
+  assert.match(delivered, /Input received while this tool ran:\n\nalso check the audio output/, "the user's steer is labelled as input");
+  assert.match(delivered, /Context received while this tool ran:\n\nCurrent runtime context: cwd \/workspace\/dsh/, "the DSH snapshot is labelled as context");
+});
+
 test("a stale completion of an abandoned turn does not drop the replacement turn's waiting call", async () => {
   const runtime = new ManualParkRuntime();
   const rejected = [];
