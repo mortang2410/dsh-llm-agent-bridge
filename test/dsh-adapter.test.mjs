@@ -605,6 +605,37 @@ test("a DSH message delivered while a tool ran is labelled as context, not as th
   assert.match(delivered, /Context received while this tool ran:\n\nCurrent runtime context: cwd \/workspace\/dsh/, "the DSH snapshot is labelled as context");
 });
 
+test("a late completion of a stopped turn does not stop the replacement turn's usage being counted", async () => {
+  const runtime = new LateCompletionOfStoppedTurnRuntime();
+  const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve() });
+  const agent = fakeAgent();
+  adapter.attachAgent(agent);
+  agent.session.append("turn/start", { turn: 1 });
+  const go = { role: "user", source: { kind: "user" }, content: [{ type: "text", text: "go" }] };
+  const first = await collect(adapter.stream({
+    provider: "claude", model: "sonnet", sessionId: agent.id, messages: [go], tools: bashTool,
+  }));
+  const call = first.find(chunk => chunk.type === "block-end" && chunk.block.type === "tool-call").block;
+
+  agent.session.append("turn/end", { turn: 1, reason: { kind: "aborted", reason: { kind: "user" } } });
+  agent.session.append("turn/start", { turn: 2 });
+  const cutShort = {
+    role: "tool", source: { kind: "tool", callId: call.id }, toolCallId: call.id,
+    content: [{ type: "text", text: "Error: tool call aborted" }], isError: true,
+  };
+  const next = { role: "user", source: { kind: "user" }, content: [{ type: "text", text: "never mind, check the logs" }] };
+  const second = await collect(adapter.stream({
+    provider: "claude", model: "sonnet", sessionId: agent.id, messages: [go, cutShort, next],
+  }));
+
+  assert.equal(second.at(-1).reason.kind, "stop", "the replacement turn finishes");
+  const usage = second.filter(chunk => chunk.type === "usage").map(chunk => chunk.usage);
+  assert.equal(usage.length, 1, "the replacement turn reports one step");
+  // Output sums over both model calls. The prompt is the largest single call's, not a sum.
+  assert.equal(usage[0].outputTokens, 40, "the output of both model calls is counted");
+  assert.equal(usage[0].inputTokens, 200, "the second model call's prompt is counted");
+});
+
 test("a stale completion of an abandoned turn does not drop the replacement turn's waiting call", async () => {
   const runtime = new ManualParkRuntime();
   const rejected = [];
@@ -1152,6 +1183,37 @@ test("each DSH step reports the usage of the model calls it made, and the steps 
   }), { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 });
   assert.deepEqual(sum, { inputTokens: 300, outputTokens: 50, cacheReadTokens: 50, cacheWriteTokens: 0 });
 });
+
+/**
+ * The replacement turn reports one model call, then the stopped turn's completion arrives
+ * late, as an interrupted SDK query can close after the next turn has started, then a
+ * second model call reports. Its turn ids are distinct, as the real SDK's are.
+ */
+class LateCompletionOfStoppedTurnRuntime extends FakeRuntime {
+  async sendMessage(sessionId, message) {
+    this.sent.push({ sessionId, message });
+    const turnId = `turn-${this.sent.length}`;
+    if (message.dshTools?.length) {
+      queueMicrotask(() => {
+        this.parked = { sessionId, turnId };
+        this.emit("activity", notification("tool/parked", sessionId, turnId, {
+          parkId: "park-1", name: message.dshTools[0].name, arguments: { command: "pwd" },
+        }));
+      });
+      return { id: turnId, status: "inProgress", items: [] };
+    }
+    queueMicrotask(() => {
+      this.emit("activity", notification("usage/apiCall", sessionId, turnId, { callId: "msg-b", usage: { input_tokens: 100, output_tokens: 10 } }));
+      this.emit("activity", notification("usage/apiCallEnded", sessionId, turnId, { callId: "msg-b" }));
+      this.emit("activity", { method: "turn/completed", params: { sessionId, turn: { id: "turn-1", status: "interrupted", error: null, items: [], usage: {} } } });
+      this.emit("activity", notification("usage/apiCall", sessionId, turnId, { callId: "msg-c", usage: { input_tokens: 200, output_tokens: 30 } }));
+      this.emit("activity", notification("usage/apiCallEnded", sessionId, turnId, { callId: "msg-c" }));
+      this.answer = "done";
+      this.finishTurn(sessionId, turnId);
+    });
+    return { id: turnId, status: "inProgress", items: [] };
+  }
+}
 
 /** A call whose output finishes only after its step has reported, as a late report would. */
 class LateReportRuntime extends FakeRuntime {

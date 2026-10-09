@@ -672,6 +672,9 @@ export class ClaudeDshAdapter extends LlmAdapter {
     if (!this.ownedSessions.has(sessionId)) return;
     if (message.method === "turn/completed") {
       const turnId = message.params?.turn?.id;
+      // A turn already released (abandoned or finished) can report late, after the session's
+      // replacement turn has taken ownership. That late completion must not release the replacement.
+      if (turnId && this.finishedTurns.has(turnId)) return;
       this.ownedSessions.delete(sessionId);
       if (!turnId) return;
       this.rememberFinished(turnId);
