@@ -636,6 +636,42 @@ test("a late completion of a stopped turn does not stop the replacement turn's u
   assert.equal(usage[0].inputTokens, 200, "the second model call's prompt is counted");
 });
 
+test("a message whose turn ends failed is offered again on the next turn", async () => {
+  const runtime = new FailingFirstTurnRuntime();
+  const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve() });
+  const agent = fakeAgent();
+  adapter.attachAgent(agent);
+  agent.session.append("turn/start", { turn: 1 });
+  const go = { role: "user", source: { kind: "user" }, content: [{ type: "text", text: "go" }] };
+  const next = { role: "user", source: { kind: "user" }, content: [{ type: "text", text: "try again" }] };
+
+  const failed = await collect(adapter.stream({ provider: "claude", model: "sonnet", sessionId: agent.id, messages: [go] }));
+  assert.equal(failed.at(-1).reason.kind, "error", "the first turn ends failed");
+
+  const retry = await collect(adapter.stream({ provider: "claude", model: "sonnet", sessionId: agent.id, messages: [go, next] }));
+  assert.equal(retry.at(-1).reason.kind, "stop");
+  assert.match(runtime.sent[1].message.text, /user: go/, "the message of the failed turn is offered as context again");
+  assert.match(runtime.sent[1].message.text, /try again/);
+});
+
+test("a message whose start send is rejected is offered on the next turn", async () => {
+  const runtime = new RejectingFirstSendRuntime();
+  const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve() });
+  const agent = fakeAgent();
+  adapter.attachAgent(agent);
+  agent.session.append("turn/start", { turn: 1 });
+  const go = { role: "user", source: { kind: "user" }, content: [{ type: "text", text: "go" }] };
+  const next = { role: "user", source: { kind: "user" }, content: [{ type: "text", text: "try again" }] };
+
+  await assert.rejects(collect(adapter.stream({ provider: "claude", model: "sonnet", sessionId: agent.id, messages: [go] })), /send refused/);
+
+  const retry = await collect(adapter.stream({ provider: "claude", model: "sonnet", sessionId: agent.id, messages: [go, next] }));
+  assert.equal(retry.at(-1).reason.kind, "stop");
+  assert.equal(runtime.sent.length, 1, "only the retried send reached Claude");
+  assert.match(runtime.sent[0].message.text, /user: go/, "the refused message is offered as context");
+  assert.match(runtime.sent[0].message.text, /try again/);
+});
+
 test("a stale completion of an abandoned turn does not drop the replacement turn's waiting call", async () => {
   const runtime = new ManualParkRuntime();
   const rejected = [];
@@ -1212,6 +1248,30 @@ class LateCompletionOfStoppedTurnRuntime extends FakeRuntime {
       this.finishTurn(sessionId, turnId);
     });
     return { id: turnId, status: "inProgress", items: [] };
+  }
+}
+
+/** The first turn ends with status "failed" after its message was sent; later turns behave normally. */
+class FailingFirstTurnRuntime extends FakeRuntime {
+  async sendMessage(sessionId, message) {
+    if (this.failed) return super.sendMessage(sessionId, message);
+    this.failed = true;
+    this.sent.push({ sessionId, message });
+    queueMicrotask(() => this.emit("activity", { method: "turn/completed", params: { sessionId, turn: {
+      id: "turn-1", status: "failed", error: { message: "upstream error" }, items: [], usage: {},
+    } } }));
+    return { id: "turn-1", status: "inProgress", items: [] };
+  }
+}
+
+/** The first send is refused by the runtime before Claude receives it. */
+class RejectingFirstSendRuntime extends FakeRuntime {
+  async sendMessage(sessionId, message) {
+    if (!this.refused) {
+      this.refused = true;
+      throw new Error("send refused");
+    }
+    return super.sendMessage(sessionId, message);
   }
 }
 

@@ -262,6 +262,7 @@ export class ClaudeDshAdapter extends LlmAdapter {
         const inputs = this.undeliveredInput(sessionId, options.messages);
         debugLog("resume", { sessionId, turnId: suspended.turnId, resolving: results.map(result => result.toolCallId), inputs: inputs.length });
         this.markBuilt(sessionId, agent);
+        const deliveredBefore = this.seen.get(String(sessionId));
         yield* this.runTurn(agent, sessionId, suspended.claudeSessionId, options, async () => {
           for (const result of resultsWithInput(results, inputs)) {
             const delivered = this.runtime.resolveToolCall(result.toolCallId, dshToolResult(result));
@@ -275,7 +276,7 @@ export class ClaudeDshAdapter extends LlmAdapter {
           }
           this.markDelivered(sessionId, options.messages);
           return suspended.turnId;
-        }, { firstEventTimeoutMs: resumeTimeoutMs(), knownTurnId: suspended.turnId });
+        }, { firstEventTimeoutMs: resumeTimeoutMs(), knownTurnId: suspended.turnId, onFailed: () => this.restoreDelivered(sessionId, deliveredBefore) });
         return;
       }
       debugLog("abandon", { sessionId, turnId: suspended.turnId, expected: suspended.calls, superseded });
@@ -300,11 +301,12 @@ export class ClaudeDshAdapter extends LlmAdapter {
     const seeded = this.seedPrompt(sessionId, options.messages, instruction, text);
     const prompt = parkedTurnRewritten ? `${seeded}\n\n${PARKED_TURN_NOTE}` : seeded;
     this.markBuilt(sessionId, agent);
+    const deliveredBefore = this.seen.get(String(sessionId));
     yield* this.runTurn(agent, sessionId, claudeSessionId, options, async () => {
       const started = await this.runtime.sendMessage(claudeSessionId, { text: prompt, ...config, dshTools });
       this.markDelivered(sessionId, options.messages);
       return started.id;
-    });
+    }, { onFailed: () => this.restoreDelivered(sessionId, deliveredBefore) });
   }
 
   /**
@@ -316,7 +318,7 @@ export class ClaudeDshAdapter extends LlmAdapter {
    * recorded in its trajectory — and then calls back into `stream()` with the
    * results, which resume the same Claude query.
    */
-  async *runTurn(agent, sessionId, claudeSessionId, options, start, { firstEventTimeoutMs = 0, knownTurnId = null } = {}) {
+  async *runTurn(agent, sessionId, claudeSessionId, options, start, { firstEventTimeoutMs = 0, knownTurnId = null, onFailed = null } = {}) {
     const queue = new ActivityQueue(options.signal, "Claude");
     const onActivity = (message) => {
       const candidate = message.params?.sessionId ?? message.params?.session?.id;
@@ -392,6 +394,7 @@ export class ClaudeDshAdapter extends LlmAdapter {
 
       this.suspended.delete(sessionId);
       if (completedTurn.status === "failed") {
+        onFailed?.();
         yield {
           type: "finish",
           reason: { kind: "error", failure: { message: completedTurn.error?.message ?? "Claude turn failed", code: "CLAUDE_TURN_FAILED" } },
@@ -410,6 +413,7 @@ export class ClaudeDshAdapter extends LlmAdapter {
         return;
       }
       this.suspended.delete(sessionId);
+      onFailed?.();
       throw error;
     } finally {
       stopActivity();
@@ -488,6 +492,17 @@ export class ClaudeDshAdapter extends LlmAdapter {
    */
   markDelivered(sessionId, messages) {
     this.seen.set(String(sessionId), messages.length);
+    this.persistLink(sessionId);
+  }
+
+  /**
+   * Put back the delivered position a turn advanced before it failed, so the input it
+   * carried is offered on the next turn. Used only for a turn that did not complete.
+   */
+  restoreDelivered(sessionId, position) {
+    const key = String(sessionId);
+    if (position === undefined) this.seen.delete(key);
+    else this.seen.set(key, position);
     this.persistLink(sessionId);
   }
 
