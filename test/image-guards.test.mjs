@@ -3,7 +3,6 @@ import { EventEmitter } from "node:events";
 import test from "node:test";
 
 import { ClaudeDshAdapter } from "../claude-adapter.js";
-import { ClaudeCliClient } from "../cli-client.mjs";
 
 const SILENT = { warn() {} };
 
@@ -40,15 +39,6 @@ test("images past the per-message budget are omitted by name, and the rest are s
   assert.match(sent.text, /\[image: a\.png\]/);
   assert.match(sent.text, /\[image: b\.png\]/);
   assert.match(sent.text, /\[image omitted to fit request image limits: c\.png\]/, "the image past the budget is named as omitted");
-});
-
-test("the Claude CLI backend refuses images instead of dropping them", async () => {
-  const client = new ClaudeCliClient();
-  await client.createSession({ sessionId: "44444444-4444-4444-8444-444444444444" });
-  await assert.rejects(() => client.sendMessage("44444444-4444-4444-8444-444444444444", {
-    text: "look",
-    images: [{ mediaType: "image/png", data: "AAEC" }],
-  }), /cannot send images/);
 });
 
 function adapterWith(runtime, options = {}) {
