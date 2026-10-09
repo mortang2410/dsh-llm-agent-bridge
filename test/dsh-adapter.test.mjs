@@ -466,6 +466,8 @@ test("a user message that replaces a parked turn fails only that turn's parked c
   // A waiting call of another chat on the same runtime must survive.
   runtime.emit("activity", notification("tool/parked", "other-claude-session", "turn-9", { parkId: "other-park", name: "bash", arguments: { command: "ls" } }));
 
+  // A call from a Claude session this adapter does not link is not kept at all.
+  assert.equal(adapter.waitingCalls.has("other-claude-session"), false, "a call from an unlinked Claude session must not be recorded");
   // The user types a new message instead of answering the parked tool call.
   await collect(adapter.stream({
     provider: "claude", model: "sonnet", sessionId: agent.id,
@@ -522,14 +524,19 @@ test("a stale completion of an abandoned turn does not drop the replacement turn
 
   // The user sends a new message, so the parked turn is replaced. The replacement parks later.
   runtime.autoPark = false;
-  const replacement = collect(adapter.stream(request("go again", bashTool)));
-  while (runtime.sent.length < 2) await new Promise(resolve => setImmediate(resolve));
+  // Errors are captured, so a replacement that throws fails the assertions below rather than hanging the suite.
+  const replacement = collect(adapter.stream(request("go again", bashTool))).then(chunks => ({ chunks }), error => ({ error }));
+  const deadline = Date.now() + 2000;
+  while (runtime.sent.length < 2 && Date.now() < deadline) await new Promise(resolve => setImmediate(resolve));
+  assert.equal(runtime.sent.length, 2, "the replacement turn must reach the runtime");
   // The interrupted first turn reports its end only after the replacement has started...
   runtime.emit("activity", { method: "turn/completed", params: { sessionId: claudeSession, turn: { id: "turn-1", status: "interrupted", error: null, items: [] } } });
   // ...and then the replacement parks its call.
   runtime.emit("activity", notification("tool/parked", claudeSession, "turn-2", { parkId: "park-2", name: "bash", arguments: { command: "date" } }));
-  const second = await replacement;
-  assert.equal(second.at(-1).reason.kind, "tool-calls", "the replacement must park");
+  const outcome = await Promise.race([replacement, new Promise(resolve => setTimeout(() => resolve({ timedOut: true }), 2000))]);
+  assert.ok(!outcome.timedOut, "the replacement turn must park or finish, not wait forever");
+  assert.ifError(outcome.error);
+  assert.equal(outcome.chunks.at(-1).reason.kind, "tool-calls", "the replacement must park");
 
   await collect(adapter.stream(request("never mind", undefined)));
   assert.deepEqual(rejected, ["park-1", "park-2"], "the replacement's waiting call is failed when the replacement is replaced");
