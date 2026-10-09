@@ -665,6 +665,79 @@ test("a stale completion of another turn does not cut a replacement step short w
   assert.equal(second.at(-1).reason.kind, "tool-calls");
 });
 
+test("a steer typed while a stopped tool ran reaches the replacement turn exactly once", async () => {
+  const runtime = new FakeRuntime();
+  const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve() });
+  const agent = fakeAgent();
+  adapter.attachAgent(agent);
+  agent.session.append("turn/start", { turn: 1 });
+  const go = { role: "user", source: { kind: "user" }, content: [{ type: "text", text: "go" }] };
+  const first = await collect(adapter.stream({
+    provider: "claude", model: "sonnet", sessionId: agent.id, messages: [go], tools: bashTool,
+  }));
+  const call = first.find(chunk => chunk.type === "block-end" && chunk.block.type === "tool-call").block;
+
+  // The user types a steer while bash runs, then DSH stops the turn and the next message starts turn 2.
+  const steer = { role: "user", source: { kind: "user" }, content: [{ type: "text", text: "also check the audio output" }] };
+  agent.session.append("turn/end", { turn: 1, reason: { kind: "aborted", reason: { kind: "user" } } });
+  agent.session.append("turn/start", { turn: 2 });
+  const cutShort = {
+    role: "tool", source: { kind: "tool", callId: call.id }, toolCallId: call.id,
+    content: [{ type: "text", text: "Error: tool call aborted" }], isError: true,
+  };
+  const next = { role: "user", source: { kind: "user" }, content: [{ type: "text", text: "never mind, check the logs" }] };
+  const second = await collect(adapter.stream({
+    provider: "claude", model: "sonnet", sessionId: agent.id, messages: [go, cutShort, steer, next],
+  }));
+
+  assert.equal(second.at(-1).reason.kind, "stop");
+  assert.equal(runtime.resolved.length, 0, "the stopped call is not resumed");
+  assert.equal(runtime.sent[1].message.text.split("also check the audio output").length - 1, 1, "the steer reaches the replacement turn once");
+});
+
+test("two resumes, each carrying a steer, deliver each steer once and in order", async () => {
+  const runtime = new ReparkOnResumeRuntime();
+  const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve() });
+  const agent = fakeAgent();
+  adapter.attachAgent(agent);
+  agent.session.append("turn/start", { turn: 1 });
+  const go = { role: "user", source: { kind: "user" }, content: [{ type: "text", text: "go" }] };
+  const first = await collect(adapter.stream({
+    provider: "claude", model: "sonnet", sessionId: agent.id, messages: [go], tools: bashTool,
+  }));
+  const firstCall = first.find(chunk => chunk.type === "block-end" && chunk.block.type === "tool-call").block;
+
+  // Resume one: a steer typed during the first call rides on its result. Claude then parks on a second call.
+  const result1 = {
+    role: "tool", source: { kind: "tool", callId: firstCall.id }, toolCallId: firstCall.id,
+    content: [{ type: "text", text: "/workspace/dsh" }], isError: false,
+  };
+  const steer1 = { role: "user", source: { kind: "user" }, content: [{ type: "text", text: "first steer" }] };
+  const messages2 = [go, result1, steer1];
+  const second = await collect(adapter.stream({ provider: "claude", model: "sonnet", sessionId: agent.id, messages: messages2, tools: bashTool }));
+  const secondCall = second.find(chunk => chunk.type === "block-end" && chunk.block.type === "tool-call").block;
+  assert.equal(second.at(-1).reason.kind, "tool-calls", "the first resume parks on a second call");
+
+  // Resume two: a steer typed during the second call.
+  const result2 = {
+    role: "tool", source: { kind: "tool", callId: secondCall.id }, toolCallId: secondCall.id,
+    content: [{ type: "text", text: "Tue" }], isError: false,
+  };
+  const steer2 = { role: "user", source: { kind: "user" }, content: [{ type: "text", text: "second steer" }] };
+  const third = await collect(adapter.stream({
+    provider: "claude", model: "sonnet", sessionId: agent.id, messages: [...messages2, result2, steer2], tools: bashTool,
+  }));
+
+  assert.equal(third.at(-1).reason.kind, "stop");
+  assert.equal(runtime.sent.length, 1, "the steers join the one turn");
+  assert.deepEqual(runtime.resolved.map(entry => entry.toolUseId), [firstCall.id, secondCall.id], "each call resumes once, in order");
+  const [onFirst, onSecond] = runtime.resolved.map(entry => entry.result.content.map(block => block.text).join("\n"));
+  assert.equal(onFirst.split("first steer").length - 1, 1, "the first steer is delivered once, on the first resume");
+  assert.equal(onFirst.split("second steer").length - 1, 0, "the second steer is not delivered early");
+  assert.equal(onSecond.split("second steer").length - 1, 1, "the second steer is delivered once, on the second resume");
+  assert.equal(onSecond.split("first steer").length - 1, 0, "the first steer is not delivered again");
+});
+
 test("a message whose turn ends failed is offered again on the next turn", async () => {
   const runtime = new FailingFirstTurnRuntime();
   const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve() });
@@ -1313,6 +1386,24 @@ class StaleCompletionDuringSettleRuntime extends FakeRuntime {
       this.emit("activity", notification("tool/parked", sessionId, turnId, { parkId: "park-b", name: "bash", arguments: { command: "date" } }));
     });
     return { id: turnId, status: "inProgress", items: [] };
+  }
+}
+
+/** Each resume of the first call is answered by a second parked call, which the next resume answers. */
+class ReparkOnResumeRuntime extends FakeRuntime {
+  resolveToolCall(toolUseId, result) {
+    this.resolved.push({ toolUseId, result });
+    const parked = this.parked;
+    if (!parked) return false;
+    this.parked = null;
+    queueMicrotask(() => {
+      const { sessionId, turnId } = parked;
+      if (this.resolved.length === 1) {
+        this.parked = { sessionId, turnId };
+        this.emit("activity", notification("tool/parked", sessionId, turnId, { parkId: "park-2", name: "bash", arguments: { command: "date" } }));
+      } else this.finishTurn(sessionId, turnId);
+    });
+    return true;
   }
 }
 
