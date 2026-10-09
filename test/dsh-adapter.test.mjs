@@ -505,6 +505,75 @@ test("aborting a turn while its tool call is parked fails only that turn's parke
   assert.deepEqual(runtime.interrupted, [{ sessionId: runtime.sent[0].sessionId, turnId: "turn-1" }], "the aborted turn is interrupted");
 });
 
+test("a message sent after DSH stops a turn mid-tool starts a new Claude turn instead of resuming the stopped one", async () => {
+  const runtime = new FakeRuntime();
+  const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve() });
+  const agent = fakeAgent();
+  adapter.attachAgent(agent);
+  agent.session.append("turn/start", { turn: 1 });
+  const go = { role: "user", source: { kind: "user" }, content: [{ type: "text", text: "go" }] };
+  const first = await collect(adapter.stream({
+    provider: "claude", model: "sonnet", sessionId: agent.id, messages: [go], tools: bashTool,
+  }));
+  assert.equal(first.at(-1).reason.kind, "tool-calls", "the first request must park on a tool call");
+  const call = first.find(chunk => chunk.type === "block-end" && chunk.block.type === "tool-call").block;
+
+  // DSH's stop cuts the running tool short, ends turn 1, and starts turn 2 with the user's next message.
+  agent.session.append("turn/end", { turn: 1, reason: { kind: "aborted", reason: { kind: "user" } } });
+  agent.session.append("turn/start", { turn: 2 });
+  const cutShort = {
+    role: "tool", source: { kind: "tool", callId: call.id }, toolCallId: call.id,
+    content: [{ type: "text", text: "Error: tool call aborted" }], isError: true,
+  };
+  const next = { role: "user", source: { kind: "user" }, content: [{ type: "text", text: "never mind, check the logs" }] };
+  const second = await collect(adapter.stream({
+    provider: "claude", model: "sonnet", sessionId: agent.id, messages: [go, cutShort, next],
+  }));
+
+  assert.equal(runtime.resolved.length, 0, "the stopped turn's tool call must not be resumed");
+  assert.equal(runtime.sent.length, 2, "the new message must start a new Claude turn");
+  assert.match(runtime.sent[1].message.text, /never mind, check the logs/, "the new message must reach Claude");
+  assert.deepEqual(runtime.interrupted, [{ sessionId: runtime.sent[0].sessionId, turnId: "turn-1" }], "the stopped turn is interrupted");
+  assert.equal(second.at(-1).reason.kind, "stop");
+});
+
+test("a message sent while a tool runs reaches Claude with that tool's result, and is delivered once", async () => {
+  const runtime = new FakeRuntime();
+  const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve() });
+  const agent = fakeAgent();
+  adapter.attachAgent(agent);
+  agent.session.append("turn/start", { turn: 1 });
+  const go = { role: "user", source: { kind: "user" }, content: [{ type: "text", text: "go" }] };
+  const first = await collect(adapter.stream({
+    provider: "claude", model: "sonnet", sessionId: agent.id, messages: [go], tools: bashTool,
+  }));
+  const call = first.find(chunk => chunk.type === "block-end" && chunk.block.type === "tool-call").block;
+
+  // A steer typed while bash runs. DSH splices it in beside the tool's result.
+  const steer = { role: "user", source: { kind: "user" }, content: [{ type: "text", text: "also check the audio output" }] };
+  const result = {
+    role: "tool", source: { kind: "tool", callId: call.id }, toolCallId: call.id,
+    content: [{ type: "text", text: "/workspace/dsh" }], isError: false,
+  };
+  const second = await collect(adapter.stream({
+    provider: "claude", model: "sonnet", sessionId: agent.id, messages: [go, result, steer], tools: bashTool,
+  }));
+
+  assert.equal(runtime.resolved.length, 1, "the parked call resumes with DSH's result");
+  const delivered = runtime.resolved[0].result.content.map(block => block.text).join("\n");
+  assert.match(delivered, /\/workspace\/dsh/, "the tool's own result must still reach Claude");
+  assert.match(delivered, /also check the audio output/, "the steer must reach Claude with the result");
+  assert.equal(runtime.sent.length, 1, "the steer joins the resumed turn rather than starting a new one");
+  assert.equal(second.at(-1).reason.kind, "stop");
+
+  // The steer was delivered once, so a later message must not carry it again.
+  const next = { role: "user", source: { kind: "user" }, content: [{ type: "text", text: "next" }] };
+  await collect(adapter.stream({
+    provider: "claude", model: "sonnet", sessionId: agent.id, messages: [go, result, steer, next],
+  }));
+  assert.equal(runtime.sent[1].message.text, "next", "a delivered steer must not be sent again as context");
+});
+
 test("a stale completion of an abandoned turn does not drop the replacement turn's waiting call", async () => {
   const runtime = new ManualParkRuntime();
   const rejected = [];

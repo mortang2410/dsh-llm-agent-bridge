@@ -252,11 +252,18 @@ export class ClaudeDshAdapter extends LlmAdapter {
     // new one starting.
     if (suspended) {
       const results = toolResultsFor(options.messages, suspended.calls);
-      if (results.length) {
-        debugLog("resume", { sessionId, turnId: suspended.turnId, resolving: results.map(result => result.toolCallId) });
+      // A DSH turn that started after the park was stopped mid-tool: DSH cut the
+      // running tool short, and the user's next message opens a new turn. Resuming
+      // the stopped query would hand Claude the cut-short result and drop that message.
+      const superseded = turnStartedSince(agent, suspended.dshSeq);
+      if (results.length && !superseded) {
+        // Input typed while the tool ran rides on its result: a running Claude query
+        // cannot take a new user message.
+        const inputs = this.undeliveredInput(sessionId, options.messages);
+        debugLog("resume", { sessionId, turnId: suspended.turnId, resolving: results.map(result => result.toolCallId), inputs: inputs.length });
         this.markBuilt(sessionId, agent);
         yield* this.runTurn(agent, sessionId, suspended.claudeSessionId, options, async () => {
-          for (const result of results) {
+          for (const result of resultsWithInput(results, inputs)) {
             const delivered = this.runtime.resolveToolCall(result.toolCallId, dshToolResult(result));
             debugLog("resolve", { toolCallId: result.toolCallId, delivered });
             if (delivered) this.waitingCalls.get(suspended.claudeSessionId)?.delete(result.toolCallId);
@@ -266,13 +273,14 @@ export class ClaudeDshAdapter extends LlmAdapter {
               throw new Error(`No Claude tool call is waiting for result ${result.toolCallId}; the turn cannot be resumed`);
             }
           }
+          this.markDelivered(sessionId, options.messages);
           return suspended.turnId;
         }, { firstEventTimeoutMs: resumeTimeoutMs(), knownTurnId: suspended.turnId });
         return;
       }
-      debugLog("abandon", { sessionId, turnId: suspended.turnId, expected: suspended.calls });
-      // No results for the calls we parked: the turn was abandoned (interrupted,
-      // or the user typed over it). Release Claude before starting a new one.
+      debugLog("abandon", { sessionId, turnId: suspended.turnId, expected: suspended.calls, superseded });
+      // No results for the calls we parked, or a newer DSH turn replaced the parked
+      // one: release Claude before starting a new one.
       await this.abandonTurn(sessionId, suspended);
     }
 
@@ -294,6 +302,7 @@ export class ClaudeDshAdapter extends LlmAdapter {
     this.markBuilt(sessionId, agent);
     yield* this.runTurn(agent, sessionId, claudeSessionId, options, async () => {
       const started = await this.runtime.sendMessage(claudeSessionId, { text: prompt, ...config, dshTools });
+      this.markDelivered(sessionId, options.messages);
       return started.id;
     });
   }
@@ -375,7 +384,7 @@ export class ClaudeDshAdapter extends LlmAdapter {
           yield { type: "tool-call-delta", index, id: call.id, name: call.name, argumentsDelta: call.arguments };
           yield { type: "block-end", index, block: { type: "tool-call", id: call.id, name: call.name, arguments: call.arguments } };
         }
-        this.suspended.set(sessionId, { claudeSessionId, turnId, calls: calls.map(call => call.id) });
+        this.suspended.set(sessionId, { claudeSessionId, turnId, calls: calls.map(call => call.id), dshSeq: logHead(agent) });
         debugLog("handoff", { sessionId, turnId, calls: calls.map(call => ({ id: call.id, name: call.name })) });
         yield { type: "finish", reason: { kind: "tool-calls" } };
         return;
@@ -388,7 +397,6 @@ export class ClaudeDshAdapter extends LlmAdapter {
           reason: { kind: "error", failure: { message: completedTurn.error?.message ?? "Claude turn failed", code: "CLAUDE_TURN_FAILED" } },
         };
       } else {
-        this.seen.set(sessionId, options.messages.length);
         this.persistLink(sessionId);
         debugLog("finish", { sessionId, turnId, kind: "stop" });
         yield { type: "finish", reason: { kind: "stop" }, replayState: { claudeSessionId, turnId } };
@@ -472,6 +480,26 @@ export class ClaudeDshAdapter extends LlmAdapter {
     for (let index = log.length - 1; index >= 0 && log[index].seq > built; index -= 1) logged.push(log[index]);
     const held = logged.reduce((seq, event) => (producedByClaude(event) ? Math.max(seq, event.seq) : seq), built);
     return logged.some(event => isReplaceEvent(event) && event.surfaceOp.startSeq <= held);
+  }
+
+  /**
+   * Record that every DSH message so far has been handed to Claude, and persist it.
+   * Called at each send, so a message DSH adds later is still undelivered.
+   */
+  markDelivered(sessionId, messages) {
+    this.seen.set(String(sessionId), messages.length);
+    this.persistLink(sessionId);
+  }
+
+  /**
+   * DSH messages past the delivered position that carry text and are not tool
+   * results: the input the user typed while a tool was running.
+   */
+  undeliveredInput(sessionId, messages) {
+    const delivered = this.seen.get(String(sessionId)) ?? 0;
+    return messages
+      .slice(delivered)
+      .filter(message => message?.role === "user" && toolResultsIn(message).length === 0 && messageText(message));
   }
 
   /** Record the DSH log position the Claude transcript now holds, and persist it. */
@@ -1095,6 +1123,30 @@ function sessionEventLog(session) {
 function logHead(agent) {
   const seq = sessionEventLog(agent.session).at(-1)?.seq;
   return Number.isSafeInteger(seq) ? seq : -1;
+}
+
+/** True when DSH started a turn after log position `seq`, which replaces any turn parked there. */
+function turnStartedSince(agent, seq) {
+  if (!Number.isSafeInteger(seq)) return false;
+  return sessionEventLog(agent.session).some(event => event.type === "turn/start" && event.seq > seq);
+}
+
+/**
+ * The results a resumed Claude query receives, with any input typed while the tool
+ * ran appended to the last one. The text is delivered once, on that result.
+ */
+function resultsWithInput(results, inputs) {
+  if (inputs.length === 0 || results.length === 0) return results;
+  const note = inputs.map(message => messageText(message)).join("\n\n");
+  const last = results.length - 1;
+  return results.map((result, index) => {
+    if (index !== last) return result;
+    const content = Array.isArray(result.content) ? result.content : [{ type: "text", text: String(result.content ?? "") }];
+    return {
+      ...result,
+      content: [...content, { type: "text", text: `Input received while this tool ran:\n\n${note}` }],
+    };
+  });
 }
 
 /** A reply the Claude route produced. DSH records the provider on the reply's message source. */
