@@ -322,7 +322,7 @@ export class ClaudeSdkClient extends EventEmitter {
     const turnId = randomUUID();
     const abortController = new AbortController();
     const options = this.queryOptions(session, message, abortController, turnId);
-    const query = this.sdk.query({ prompt: message.text, options });
+    const query = this.sdk.query({ prompt: promptFor(message), options });
     this.queries.set(turnId, { query, abortController, sessionId });
     void this.consumeQuery(session, turnId, query).catch((error) => {
       this.emit("diagnostic", `Claude SDK query failed: ${error?.stack ?? error}`);
@@ -544,6 +544,26 @@ function jsonSchemaShape(schema) {
     }
     return [name, required.has(name) ? field : field.optional()];
   }));
+}
+
+/**
+ * A string prompt cannot carry images, so a turn with images sends its text and images as one user
+ * message in a stream. Every query here has a channel the SDK answers while the run goes on: the
+ * in-process DSH tool server when DSH tools are present, otherwise the permission callback. So the
+ * SDK holds the input open until the run ends, as it does for a string prompt.
+ */
+function promptFor(message) {
+  if (!message.images?.length) return message.text;
+  return userMessageStream(message.text, message.images);
+}
+
+async function* userMessageStream(text, images) {
+  const content = [
+    { type: "text", text },
+    ...images.map(image => ({ type: "image", source: { type: "base64", media_type: image.mediaType, data: image.data } })),
+  ];
+  // session_id "" matches the message the SDK writes for a string prompt.
+  yield { type: "user", session_id: "", message: { role: "user", content }, parent_tool_use_id: null };
 }
 
 export function dshToolResult(result) {

@@ -119,7 +119,7 @@ export class ClaudeSessionRuntime extends EventEmitter {
     // Per-turn, owned by the caller rather than by session state: the harness's
     // assembled prompt and its tool bridge. These must reach the client
     // untouched — dropping them leaves the model with no tools at all.
-    systemPrompt, settingSources, dshTools, executeDshTool, permissionMode, thinkingSummaries,
+    systemPrompt, settingSources, dshTools, executeDshTool, permissionMode, thinkingSummaries, images,
   } = {}) {
     const session = this.requireSession(sessionId);
     if (!text?.trim()) throw new Error("message text is required");
@@ -139,6 +139,7 @@ export class ClaudeSessionRuntime extends EventEmitter {
       ...(permissionMode !== undefined ? { permissionMode } : {}),
       ...(thinkingSummaries !== undefined ? { thinkingSummaries } : {}),
       ...(dshTools !== undefined ? { dshTools } : {}),
+      ...(images !== undefined ? { images } : {}),
       ...(executeDshTool !== undefined ? { executeDshTool } : {}),
     });
     this.ensureTurn(session, turn);

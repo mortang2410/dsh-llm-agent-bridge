@@ -10,11 +10,25 @@ export const CLAUDE_PROVIDER = "claude";
 /** Appended when a parked turn continues in a new Claude session after DSH rewrote its history. */
 const PARKED_TURN_NOTE = "Earlier tool calls for this request already ran. Their results, or the summary of them, are in the context above; continue from them and do not repeat those calls.";
 
+/**
+ * Most raw bytes sent for one image. Base64 adds a third, so the encoded image stays under 5 MB,
+ * the per-image limit on Bedrock and Google Cloud. A stored image over this size is re-encoded by
+ * DSH to fit; only an image that still does not fit is not sent.
+ */
+const IMAGE_BYTE_LIMIT = 3_750_000;
+
+/**
+ * Most raw bytes sent for all images of one message. Claude's API caps a request at 32 MB, and base64
+ * adds a third, so 15 MB of images stays under that cap with the text beside it.
+ */
+const IMAGE_BYTES_PER_MESSAGE = 15_000_000;
+
 export class ClaudeDshAdapter extends LlmAdapter {
-  constructor({ runtime, ready, linkStore = null, logger = console, telemetry = scanOnlyTelemetryControl(), thinkingSummaries = true }) {
+  constructor({ runtime, ready, linkStore = null, logger = console, telemetry = scanOnlyTelemetryControl(), thinkingSummaries = true, resolveAttachments = () => undefined }) {
     super();
     this.telemetry = telemetry;
     this.thinkingSummaries = thinkingSummaries;
+    this.resolveAttachments = resolveAttachments;
     this.runtime = runtime;
     this.ready = ready;
     this.logger = logger;
@@ -286,7 +300,12 @@ export class ClaudeDshAdapter extends LlmAdapter {
     }
 
     const instruction = latestUserIndex(options.messages);
-    const text = instruction === -1 ? "" : messageText(options.messages[instruction]);
+    const { text, images } = instruction === -1 ? { text: "", images: [] } : await this.instructionInput(options.messages[instruction], options.signal);
+    // A stop during the image read ends the turn before anything is sent, as a stop during a turn does.
+    if (options.signal?.aborted) {
+      yield { type: "finish", reason: { kind: "aborted", failure: { message: "Claude turn cancelled", code: "ABORTED" } } };
+      return;
+    }
     if (!text) throw new Error("The Claude adapter received no user text");
     const nativePermissions = permissionConfiguration(sessionEventLog(agent.session));
     const config = this.configure(sessionId, {
@@ -303,7 +322,7 @@ export class ClaudeDshAdapter extends LlmAdapter {
     this.markBuilt(sessionId, agent);
     const deliveredBefore = this.seen.get(String(sessionId));
     yield* this.runTurn(agent, sessionId, claudeSessionId, options, async () => {
-      const started = await this.runtime.sendMessage(claudeSessionId, { text: prompt, ...config, dshTools });
+      const started = await this.runtime.sendMessage(claudeSessionId, { text: prompt, images, ...config, dshTools });
       this.markDelivered(sessionId, options.messages);
       return started.id;
     }, { onFailed: () => this.restoreDelivered(sessionId, deliveredBefore) });
@@ -514,7 +533,45 @@ export class ClaudeDshAdapter extends LlmAdapter {
     const delivered = this.seen.get(String(sessionId)) ?? 0;
     return messages
       .slice(delivered)
-      .filter(message => message?.role === "user" && toolResultsIn(message).length === 0 && messageText(message));
+      .filter(message => message?.role === "user" && toolResultsIn(message).length === 0 && userText(message));
+  }
+
+  /**
+   * The text and images of the message Claude is asked to act on. Each image is read from the
+   * attachment service and sent as an image block. An image that cannot be sent is still named
+   * in the text, so no attachment passes unnoticed. An offloaded image has no bytes here, so it is
+   * named and not read; the label is the bridge's own text, the same as for any image not sent.
+   */
+  async instructionInput(message, signal) {
+    const sent = new Map();
+    const images = [];
+    let budget = IMAGE_BYTES_PER_MESSAGE;
+    for (const block of message.content ?? []) {
+      if (block?.type !== "image" || block.offloaded === true) continue;
+      try {
+        const request = await this.readImage(block.attachment, signal);
+        if (request.data.byteLength > budget) throw new Error(`the images of this message exceed ${IMAGE_BYTES_PER_MESSAGE} bytes in total`);
+        budget -= request.data.byteLength;
+        images.push({ mediaType: request.mediaType, data: Buffer.from(request.data).toString("base64") });
+        sent.set(block, { mediaType: request.mediaType, width: request.width, height: request.height });
+      } catch (error) {
+        this.logger.warn(`Claude image not attached: ${error?.message ?? error}`);
+      }
+    }
+    return { text: userText(message, sent), images };
+  }
+
+  /**
+   * One image from the attachment service. DSH returns the stored image when it fits the byte limit,
+   * and otherwise a re-encoded version that fits, as its other adapters receive it. Throws when the
+   * service is missing, the read fails, or no version fits.
+   */
+  async readImage(ref, signal) {
+    const store = this.resolveAttachments();
+    if (!store) throw new Error("the attachment service is not available");
+    const request = await store.readImageRequest(ref, { width: ref.width, height: ref.height, maxBytes: IMAGE_BYTE_LIMIT }, signal);
+    if (request.data.byteLength > IMAGE_BYTE_LIMIT) throw new Error(`${ref.name ?? "image"} does not fit in ${IMAGE_BYTE_LIMIT} bytes`);
+    return request;
   }
 
   /** Record the DSH log position the Claude transcript now holds, and persist it. */
@@ -1165,8 +1222,8 @@ function resultsWithInput(results, inputs) {
   const typed = inputs.filter(message => USER_SOURCE_KINDS.has(message.source?.kind));
   const context = inputs.filter(message => !USER_SOURCE_KINDS.has(message.source?.kind));
   const notes = [
-    typed.length > 0 && `Input received while this tool ran:\n\n${typed.map(message => messageText(message)).join("\n\n")}`,
-    context.length > 0 && `Context received while this tool ran:\n\n${context.map(message => messageText(message)).join("\n\n")}`,
+    typed.length > 0 && `Input received while this tool ran:\n\n${typed.map(message => userText(message)).join("\n\n")}`,
+    context.length > 0 && `Context received while this tool ran:\n\n${context.map(message => userText(message)).join("\n\n")}`,
   ].filter(Boolean);
   const last = results.length - 1;
   return results.map((result, index) => {
@@ -1240,7 +1297,7 @@ function latestUserIndex(messages) {
   let fallback = -1;
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index];
-    if (message?.role !== "user" || !messageText(message)) continue;
+    if (message?.role !== "user" || !userText(message)) continue;
     if (message.source?.kind === "user") return index;
     if (fallback === -1) fallback = index;
   }
@@ -1250,7 +1307,7 @@ function latestUserIndex(messages) {
 /**
  * Render one message for the catch-up block.
  *
- * Unlike {@link messageText} this keeps the tool work, because a turn answered
+ * Unlike {@link userText} this keeps the tool work, because a turn answered
  * by another model is mostly tool calls and their results — carrying only the
  * prose would hand Claude a summary of work it cannot see. Results are bounded:
  * this is context, not a transcript.
@@ -1274,6 +1331,7 @@ function seedText(message) {
   }
   for (const block of message?.content ?? []) {
     if (block?.type === "text" && block.text?.trim()) parts.push(block.text.trim());
+    if (block?.type === "image") parts.push(imageLabel(block));
     if (block?.type === "tool-call") parts.push(`called ${block.name}(${bound(block.arguments, 400)})`);
   }
   for (const result of results) {
@@ -1299,21 +1357,33 @@ function bound(value, limit) {
   return text.length > limit ? `${text.slice(0, limit)}…` : text;
 }
 
-function messageText(message) {
+/**
+ * What a message says to the model: its text blocks in order, with one label per image. `sent` maps
+ * each image block Claude receives this turn to the version sent; any other image is labelled as not attached.
+ */
+function userText(message, sent = new Map()) {
   return (message?.content ?? [])
-    .filter(block => block.type === "text")
-    .map(block => block.text)
+    .map(block => {
+      if (block?.type === "text") return block.text;
+      if (block?.type === "image") return imageLabel(block, sent.get(block));
+      return null;
+    })
+    .filter(part => typeof part === "string")
     .join("\n")
     .trim();
 }
 
+/** Names an image in the text Claude reads. `shown` is the version sent; without it the label says the image was not attached. */
+function imageLabel(block, shown) {
+  const ref = block.attachment ?? {};
+  const { width, height, mediaType } = shown ?? ref;
+  const note = shown ? "" : "; not attached to this turn";
+  return `[image: ${ref.name ?? "image"}, ${width}x${height} ${mediaType}${note}]`;
+}
+
 function auxiliaryInput(messages) {
   return messages.map((message) => {
-    const text = (message?.content ?? [])
-      .filter(block => block.type === "text")
-      .map(block => block.text)
-      .join("\n")
-      .trim();
+    const text = userText(message);
     return text ? `${message.role ?? "user"}: ${text}` : "";
   }).filter(Boolean).join("\n\n");
 }

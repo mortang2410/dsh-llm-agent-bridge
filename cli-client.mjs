@@ -67,6 +67,9 @@ export class ClaudeCliClient extends EventEmitter {
     if (Array.isArray(message.dshTools) && message.dshTools.length > 0) {
       throw new Error("The Claude CLI backend cannot expose DSH tools; use the Claude Agent SDK backend");
     }
+    if (Array.isArray(message.images) && message.images.length > 0) {
+      throw new Error("The Claude CLI backend cannot send images; use the Claude Agent SDK backend");
+    }
     const session = this.sessions.get(sessionId) ?? (await this.resumeSession(sessionId, message));
     const turnId = randomUUID();
     const child = this.spawnTurn(session, turnId, message);

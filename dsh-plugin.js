@@ -54,13 +54,19 @@ export function createDshClaudePlugin(ctx, config = {}) {
       // This only reads, synchronously, so the operator sees the posture in
       // the log before the first turn is refused or shuts the exporter down.
       reportTelemetryPosture(telemetry, config.telemetry, ctx.logger);
+      // The attachment service supplies the bytes of images a user attaches. It is optional, as the
+      // connection is: without it an image is named in the text and not sent, and the turn still runs.
+      let attachments = null;
+      const attachmentsFiber = ctx.inject(["attachments"], (scoped) => { attachments = scoped; });
       const adapter = new ClaudeDshAdapter({
         runtime, ready: runtime.whenReady(), telemetry,
         thinkingSummaries: config.thinkingSummaries,
         linkStore: new ClaudeLinkStore(resolveLinkPath(config.linkPath)), logger: ctx.logger,
+        resolveAttachments: () => attachments?.get("attachments"),
       });
       defer(ctx.llm.registerAdapter([CLAUDE_PROVIDER], adapter));
       defer(() => adapter.dispose());
+      defer(() => attachmentsFiber?.dispose?.());
       defer(runtime.subscribeRequest(request => {
         void handleClaudeSdkRequest(ctx, { adapter, runtime, request })
           .catch(error => ctx.logger.error(`Relay failed to handle a Claude interaction: ${error?.stack ?? error}`));
