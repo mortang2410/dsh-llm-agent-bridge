@@ -561,6 +561,31 @@ test("replacing one chat's parked turn fails only that chat's waiting call, whil
   assert.deepEqual(runtime.interrupted, [{ sessionId: runtime.sent[0].sessionId, turnId: "turn-1" }], "only chat A's turn is interrupted");
 });
 
+test("a call whose result was delivered is not failed when a later turn in the chat is replaced", async () => {
+  const runtime = new ManualParkRuntime();
+  const rejected = [];
+  runtime.rejectToolCall = (parkId) => { rejected.push(parkId); return true; };
+  const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve() });
+  const agent = fakeAgent();
+  adapter.attachAgent(agent);
+  const ask = (messages, tools) => collect(adapter.stream({ provider: "claude", model: "sonnet", sessionId: agent.id, messages, tools }));
+  const user = text => ({ role: "user", source: { kind: "user" }, content: [{ type: "text", text }] });
+
+  const go = user("go");
+  const first = await ask([go], bashTool);
+  assert.equal(first.at(-1).reason.kind, "tool-calls", "the first turn must park");
+  const call = first.find(chunk => chunk.type === "block-end" && chunk.block.type === "tool-call");
+  const result = { role: "user", content: [{ type: "tool-result", toolCallId: call.block.id, content: [{ type: "text", text: "done" }] }] };
+  const resumed = await ask([go, result], bashTool);
+  assert.equal(resumed.at(-1).reason.kind, "stop", "the delivered result finishes the turn");
+
+  const later = await ask([go, result, user("again")], bashTool);
+  assert.equal(later.at(-1).reason.kind, "tool-calls", "the later turn must park");
+  await ask([user("never mind")], undefined);
+
+  assert.deepEqual(rejected, ["park-2"], "park-1 was answered, so only the later turn's call is failed");
+});
+
 test("a plain follow-up keeps the Claude session, and rewriting only the system prompt does not reset it", async () => {
   const runtime = new FakeRuntime();
   const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve() });
@@ -1109,6 +1134,7 @@ class ManualParkRuntime extends FakeRuntime {
     if (!hasTools) {
       queueMicrotask(() => this.finishTurn(sessionId, turnId));
     } else if (this.autoPark) {
+      this.parked = { sessionId, turnId };
       queueMicrotask(() => this.emit("activity", notification("tool/parked", sessionId, turnId, {
         parkId: `park-${this.sent.length}`, name: "bash", arguments: { command: "pwd" },
       })));
