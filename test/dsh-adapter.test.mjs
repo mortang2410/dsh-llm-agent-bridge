@@ -2166,6 +2166,24 @@ test("detaching an agent rejects the tool calls its parked turn is waiting on", 
   assert.ok(rejected[0].error instanceof Error, "the call is failed with an Error");
 });
 
+test("detaching an agent drops its parked turn's usage ledger", async () => {
+  const runtime = new FakeRuntime();
+  const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve() });
+  const agent = fakeAgent();
+  adapter.attachAgent(agent);
+  const tools = [{ name: "bash", description: "run", parameters: { type: "object", properties: {} } }];
+  await collect(adapter.stream({ provider: "claude", model: "sonnet", sessionId: agent.id, messages: [userMessage("list")], tools }));
+  const claudeSessionId = adapter.sessionFor(agent.id);
+  assert.ok(adapter.suspended.has(agent.id), "precondition: the turn is parked on its tool call");
+  // The SDK reports usage while the turn is parked, so the turn owns a ledger no live step will read again.
+  runtime.emit("activity", notification("usage/apiCall", claudeSessionId, "turn-1", { callId: "msg-a", usage: { input_tokens: 100 } }));
+  assert.deepEqual([...adapter.usageLedgers.keys()], ["turn-1"], "precondition: the parked turn has a ledger");
+
+  adapter.detachAgent(agent.id);
+
+  assert.equal(adapter.usageLedgers.size, 0, "the disposed agent's parked turn must not leave its usage ledger behind");
+});
+
 test("a tool call that cannot be failed on detach is logged, and the Claude session is still released", async () => {
   const runtime = new FakeRuntime();
   runtime.rejectToolCall = () => { throw new Error("reject refused"); };

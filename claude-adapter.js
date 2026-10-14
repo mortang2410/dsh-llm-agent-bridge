@@ -139,10 +139,12 @@ export class ClaudeDshAdapter extends LlmAdapter {
     const claudeSessionId = this.links.get(key);
     if (!claudeSessionId) return;
     // A turn parked on a tool call cannot resume once its query is closed, so drop it rather
-    // than let the next stream resume a query that no longer exists.
+    // than let the next stream resume a query that no longer exists. Read the record before
+    // deleting it: its turn id is what the release needs to drop that turn's usage ledger.
+    const suspended = this.suspended.get(key);
     this.suspended.delete(key);
-    this.ownedSessions.delete(claudeSessionId);
-    this.readers.delete(claudeSessionId);
+    // The same cleanup a released turn runs, so the parked turn's ledger does not outlive it.
+    this.releaseTurn(claudeSessionId, suspended?.turnId);
     // Fail the calls the turn is waiting on, as releaseParkedTurn does, so none stays pending in the SDK client.
     const disposal = new Error("The DSH agent was disposed while the turn was waiting for a tool result");
     for (const call of this.takeWaitingCalls(claudeSessionId)) {
