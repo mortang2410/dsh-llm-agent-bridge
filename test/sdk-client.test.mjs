@@ -230,6 +230,39 @@ test("Claude SDK client interrupts and aborts an in-progress query", async () =>
   assert.equal(queryParams.options.abortController.signal.aborted, true);
 });
 
+test("a CLI that never answers interrupt still aborts and closes the query", async () => {
+  let queryParams = null;
+  let closed = 0;
+  const sdk = {
+    query(params) {
+      queryParams = params;
+      return {
+        async next() { return new Promise(() => {}); },
+        async return() { return { done: true }; },
+        [Symbol.asyncIterator]() { return this; },
+        // A CLI that never answers the interrupt control request: the promise stays pending.
+        interrupt() { return new Promise(() => {}); },
+        close() { closed += 1; },
+      };
+    },
+  };
+  const client = new ClaudeSdkClient({ sdk, interruptTimeoutMs: 50 });
+  await client.start();
+  const session = await client.createSession({ sessionId: "44444444-4444-4444-8444-444444444444" });
+  const turn = await client.sendMessage(session.id, { text: "keep working" });
+
+  // Without the bound, interruptTurn never returns, so the abort and the close below never run
+  // and the CLI child stays alive. The race turns that hang into a bounded failure.
+  const outcome = await Promise.race([
+    client.interruptTurn(session.id, turn.id).then(() => "returned"),
+    new Promise(resolve => { setTimeout(() => resolve("hung"), 1000); }),
+  ]);
+
+  assert.equal(outcome, "returned");
+  assert.equal(closed, 1);
+  assert.equal(queryParams.options.abortController.signal.aborted, true);
+});
+
 test("each model call's usage reaches the harness as the SDK reports it", async () => {
   const sdk = {
     query(params) {

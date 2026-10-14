@@ -107,7 +107,7 @@ function disambiguate(models, rows) {
 }
 
 export class ClaudeSdkClient extends EventEmitter {
-  constructor({ sdk = null, pathToClaudeCodeExecutable = undefined, env = undefined, requestTimeoutMs = 30 * 60_000, clock = Date.now } = {}) {
+  constructor({ sdk = null, pathToClaudeCodeExecutable = undefined, env = undefined, requestTimeoutMs = 30 * 60_000, interruptTimeoutMs = 5_000, clock = Date.now } = {}) {
     super();
     this.sdk = sdk;
     this.pathToClaudeCodeExecutable = pathToClaudeCodeExecutable;
@@ -116,6 +116,9 @@ export class ClaudeSdkClient extends EventEmitter {
     // from the process environment and pointed ANTHROPIC_BASE_URL at a gateway.
     this.env = env;
     this.requestTimeoutMs = requestTimeoutMs;
+    // A CLI that never answers the interrupt control request would otherwise leave interruptTurn
+    // pending forever; see that method for why a pending interrupt leaks the child.
+    this.interruptTimeoutMs = Number.isFinite(interruptTimeoutMs) && interruptTimeoutMs > 0 ? interruptTimeoutMs : 5_000;
     this.clock = clock;
     this.sessions = new Map();
     this.queries = new Map();
@@ -332,10 +335,38 @@ export class ClaudeSdkClient extends EventEmitter {
     return { id: turnId, status: "inProgress", items: [] };
   }
 
+  /**
+   * Stop one in-flight turn.
+   *
+   * `interrupt()` is a control request the CLI answers when it can. A CLI that never answers
+   * leaves the promise pending forever, so the abort and the close below would never run and the
+   * CLI child would stay alive. DSH waits for the turn to become idle before it disposes the
+   * agent, so a pending interrupt also stops the release in `detachAgent` from being reached.
+   * Bound the wait, then abort and close regardless: the close ends the control request and the
+   * child with it.
+   */
   async interruptTurn(_sessionId, turnId) {
     const record = this.queries.get(turnId);
     if (!record) return;
-    await record.query.interrupt?.().catch(() => {});
+    let interrupted;
+    try {
+      interrupted = record.query.interrupt?.();
+    } catch {
+      interrupted = undefined;
+    }
+    if (interrupted && typeof interrupted.then === "function") {
+      let timer;
+      try {
+        await Promise.race([
+          interrupted,
+          new Promise((resolve) => { timer = setTimeout(resolve, this.interruptTimeoutMs); }),
+        ]);
+      } catch {
+        // The interrupt itself failed. The abort and the close below still apply.
+      } finally {
+        clearTimeout(timer);
+      }
+    }
     record.abortController.abort();
     record.query.close?.();
   }
