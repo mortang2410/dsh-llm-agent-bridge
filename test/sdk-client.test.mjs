@@ -614,3 +614,87 @@ test("a message without images keeps a plain string prompt", async () => {
   await client.sendMessage(session.id, { text: "plain text" });
   assert.equal(captured.prompt, "plain text");
 });
+
+// Query fake whose message stream ends after `messages`, and whose close() is `close`.
+function queryThatEndsWith(messages, close) {
+  return Object.assign((async function* () { yield* messages; })(), { close });
+}
+
+function startedMessage(sessionId) {
+  return { type: "stream_event", session_id: sessionId, uuid: "s1", parent_tool_use_id: null, event: { type: "message_start", message: { id: "msg-1", usage: {} } } };
+}
+
+test("a turn whose message stream ends without a result closes its query and drops the map entry", async () => {
+  let closed = 0;
+  const sdk = {
+    query(params) {
+      return queryThatEndsWith([startedMessage(params.options.sessionId)], () => { closed += 1; });
+    },
+  };
+  const client = new ClaudeSdkClient({ sdk });
+  const activity = [];
+  client.on("activity", message => activity.push(message));
+  await client.start();
+  const session = await client.createSession({ sessionId: "77777777-7777-4777-8777-777777777777" });
+  const turn = await client.sendMessage(session.id, { text: "hello" });
+  await untilTurnCompleted(activity);
+
+  assert.equal(closed, 1, "the query is closed exactly once when its stream ends without a result");
+  assert.equal(client.queries.has(turn.id), false, "the finished turn's map entry is dropped");
+});
+
+test("a rejected close after a finished turn is reported as a diagnostic, not an unhandled rejection", async () => {
+  const unhandled = [];
+  const onUnhandled = reason => unhandled.push(reason);
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    const sdk = {
+      query(params) {
+        return queryThatEndsWith([startedMessage(params.options.sessionId)], () => Promise.reject(new Error("close refused by the transport")));
+      },
+    };
+    const client = new ClaudeSdkClient({ sdk });
+    const activity = [];
+    const diagnostics = [];
+    client.on("activity", message => activity.push(message));
+    client.on("diagnostic", message => diagnostics.push(message));
+    await client.start();
+    const session = await client.createSession({ sessionId: "88888888-8888-4888-8888-888888888888" });
+    await client.sendMessage(session.id, { text: "hello" });
+    await untilTurnCompleted(activity);
+    await new Promise(resolve => setTimeout(resolve, 20));
+
+    assert.deepEqual(unhandled, [], "a rejected close must be caught, not left as an unhandled rejection");
+    assert.ok(diagnostics.some(message => message.includes("close refused by the transport")), "the rejected close is reported as a diagnostic");
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+  }
+});
+
+test("a query started with resume is closed by releaseSession under the Claude session id", async () => {
+  const CLAUDE_SESSION = "55555555-5555-4555-8555-555555555555";
+  const started = [];
+  let closed = 0;
+  let releaseNext;
+  const sdk = {
+    query(params) {
+      started.push(params.options);
+      return {
+        async next() { return new Promise(resolve => { releaseNext = resolve; }); },
+        async return() { return { done: true }; },
+        [Symbol.asyncIterator]() { return this; },
+        async interrupt() {},
+        close() { closed += 1; releaseNext?.({ done: true }); },
+      };
+    },
+  };
+  const client = new ClaudeSdkClient({ sdk });
+  await client.start();
+  await client.resumeSession(CLAUDE_SESSION, { cwd: "/workspace/relay" });
+  await client.sendMessage(CLAUDE_SESSION, { text: "continue" });
+
+  assert.equal(started[0].resume, CLAUDE_SESSION, "the query resumes the existing Claude session");
+  await client.releaseSession(CLAUDE_SESSION);
+  assert.ok(closed >= 1, "releasing the session closes the resumed query");
+  assert.equal(client.queries.size, 0, "no query is left registered for the released session");
+});

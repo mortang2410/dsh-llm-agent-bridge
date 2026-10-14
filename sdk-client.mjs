@@ -466,7 +466,18 @@ export class ClaudeSdkClient extends EventEmitter {
       }
       if (!completed) this.completeTurn(session.id, turnId, "completed");
     } finally {
+      // Drop the map entry, then close the query so its CLI child process is terminated even
+      // when the message stream ended without a result.
       this.queries.delete(turnId);
+      try {
+        const closing = query.close?.();
+        // close() is typed as void, but a thenable must not leave an unhandled rejection behind.
+        if (typeof closing?.then === "function") {
+          closing.then(undefined, error => this.emit("diagnostic", `Claude SDK query close failed: ${error?.stack ?? error}`));
+        }
+      } catch (error) {
+        this.emit("diagnostic", `Claude SDK query close failed: ${error?.stack ?? error}`);
+      }
     }
   }
 

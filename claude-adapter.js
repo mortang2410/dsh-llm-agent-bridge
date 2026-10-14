@@ -128,8 +128,31 @@ export class ClaudeDshAdapter extends LlmAdapter {
     return true;
   }
 
+  /**
+   * DSH has disposed the agent, so no further turn will run on its Claude session. Release the
+   * Claude session, which closes the CLI process it still holds. The link and its configuration
+   * are kept, so reopening the same DSH session resumes the same Claude transcript.
+   */
   detachAgent(sessionId) {
-    this.agents.delete(String(sessionId));
+    const key = String(sessionId);
+    this.agents.delete(key);
+    const claudeSessionId = this.links.get(key);
+    if (!claudeSessionId) return;
+    // A turn parked on a tool call cannot resume once its query is closed, so drop it rather
+    // than let the next stream resume a query that no longer exists.
+    this.suspended.delete(key);
+    this.ownedSessions.delete(claudeSessionId);
+    this.readers.delete(claudeSessionId);
+    if (typeof this.runtime.releaseSession !== "function") return;
+    // `agent/disposed` listeners are declared void, so the host cannot await this. The call is
+    // made synchronously, so the release happens before any code after the detach in the same
+    // tick. A rejection is logged here rather than left unhandled.
+    const warn = error => this.logger?.warn?.(`Relay could not release Claude session ${claudeSessionId} after its DSH agent was disposed: ${error?.message ?? error}`);
+    try {
+      Promise.resolve(this.runtime.releaseSession(claudeSessionId)).catch(warn);
+    } catch (error) {
+      warn(error);
+    }
   }
 
   configuration(sessionId, cwd) {

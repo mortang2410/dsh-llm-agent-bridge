@@ -2045,3 +2045,104 @@ test("an image DSH offloaded to fit its limits is named as omitted, and its byte
   assert.equal(runtime.sent[0].message.images, undefined);
   assert.equal(attachments.reads.length, 0, "DSH chose not to send these bytes, so none are read");
 });
+
+// Disposing a DSH agent releases its Claude session, and keeps the link so a reopened agent resumes it.
+test("detaching an agent releases its Claude session and keeps the link", async () => {
+  const runtime = new FakeRuntime();
+  const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve() });
+  const agent = fakeAgent();
+  adapter.attachAgent(agent);
+  const claudeSessionId = await adapter.ensureSession(agent.id);
+
+  adapter.detachAgent(agent.id);
+
+  assert.deepEqual(runtime.released, [claudeSessionId], "the disposed agent's Claude session is released");
+  assert.equal(adapter.sessionFor(agent.id), claudeSessionId, "the link survives, so a reopened agent can resume the transcript");
+});
+
+test("a rejected release after detach is logged, not left as an unhandled rejection", async () => {
+  const unhandled = [];
+  const onUnhandled = reason => unhandled.push(reason);
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    const runtime = new FakeRuntime();
+    runtime.releaseSession = async () => { throw new Error("release refused"); };
+    const warnings = [];
+    const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve(), logger: { warn: message => warnings.push(message) } });
+    const agent = fakeAgent();
+    adapter.attachAgent(agent);
+    await adapter.ensureSession(agent.id);
+
+    adapter.detachAgent(agent.id);
+    await new Promise(resolve => setTimeout(resolve, 20));
+
+    assert.deepEqual(unhandled, [], "the rejection must be caught inside the adapter");
+    assert.ok(warnings.some(message => message.includes("release refused")), "the failed release is logged as a warning");
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+  }
+});
+
+test("a reopened agent resumes its released Claude session by the linked id, not a new one", async () => {
+  const runtime = new FakeRuntime();
+  const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve() });
+  const agent = fakeAgent();
+  adapter.attachAgent(agent);
+  agent.session.append("user/message", {});
+  await collect(adapter.stream({ provider: "claude", model: "sonnet", sessionId: agent.id, messages: [userMessage("first question")] }));
+  const linked = adapter.sessionFor(agent.id);
+
+  adapter.detachAgent(agent.id);
+  adapter.attachAgent(agent);
+  agent.session.append("assistant/message", claudeReply(), { surfaceOp: "append" });
+  agent.session.append("user/message", {}, { surfaceOp: "append" });
+  await collect(adapter.stream({
+    provider: "claude", model: "sonnet", sessionId: agent.id,
+    messages: [userMessage("first question"), replyMessage("done"), userMessage("second question")],
+  }));
+
+  assert.equal(runtime.resumed, 1, "the released session is resumed by its linked id");
+  assert.equal(runtime.createdConfigs.length, 1, "no replacement Claude session is created");
+  assert.equal(adapter.sessionFor(agent.id), linked, "the link is unchanged");
+  assert.equal(runtime.sent.at(-1).sessionId, linked, "the new turn runs on the same Claude session");
+});
+
+test("detaching an agent with no Claude session releases nothing", () => {
+  const runtime = new FakeRuntime();
+  const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve() });
+  const agent = fakeAgent();
+  adapter.attachAgent(agent);
+
+  adapter.detachAgent(agent.id);
+
+  assert.deepEqual(runtime.released, [], "no link means no Claude session to release");
+  assert.equal(adapter.agents.has(agent.id), false, "the agent entry is still removed");
+});
+
+test("detaching an agent drops its parked turn", async () => {
+  const runtime = new FakeRuntime();
+  const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve() });
+  const agent = fakeAgent();
+  adapter.attachAgent(agent);
+  const tools = [{ name: "bash", description: "run", parameters: { type: "object", properties: {} } }];
+  await collect(adapter.stream({ provider: "claude", model: "sonnet", sessionId: agent.id, messages: [userMessage("list")], tools }));
+  assert.ok(adapter.suspended.has(agent.id), "precondition: the turn is parked on its tool call");
+
+  adapter.detachAgent(agent.id);
+
+  assert.equal(adapter.suspended.has(agent.id), false, "a parked turn cannot resume once its query is released");
+});
+
+test("the Claude session is released synchronously, before detachAgent returns", async () => {
+  const runtime = new FakeRuntime();
+  const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve() });
+  const agent = fakeAgent();
+  adapter.attachAgent(agent);
+  await adapter.ensureSession(agent.id);
+  const releasedDuringDetach = [];
+  runtime.releaseSession = sessionId => { releasedDuringDetach.push(sessionId); return Promise.resolve(); };
+
+  adapter.detachAgent(agent.id);
+
+  assert.equal(releasedDuringDetach.length, 1, "releaseSession must run before any code after detachAgent in the same tick");
+});
