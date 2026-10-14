@@ -143,6 +143,9 @@ export class ClaudeDshAdapter extends LlmAdapter {
     this.suspended.delete(key);
     this.ownedSessions.delete(claudeSessionId);
     this.readers.delete(claudeSessionId);
+    // Fail the calls the turn is waiting on, as releaseParkedTurn does, so none stays pending in the SDK client.
+    const disposal = new Error("The DSH agent was disposed while the turn was waiting for a tool result");
+    for (const call of this.takeWaitingCalls(claudeSessionId)) this.runtime.rejectToolCall?.(call, disposal);
     if (typeof this.runtime.releaseSession !== "function") return;
     // `agent/disposed` listeners are declared void, so the host cannot await this. The call is
     // made synchronously, so the release happens before any code after the detach in the same

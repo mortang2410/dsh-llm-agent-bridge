@@ -2146,3 +2146,22 @@ test("the Claude session is released synchronously, before detachAgent returns",
 
   assert.equal(releasedDuringDetach.length, 1, "releaseSession must run before any code after detachAgent in the same tick");
 });
+
+test("detaching an agent rejects the tool calls its parked turn is waiting on", async () => {
+  const runtime = new FakeRuntime();
+  const rejected = [];
+  runtime.rejectToolCall = (parkId, error) => { rejected.push({ parkId, error }); return true; };
+  const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve() });
+  const agent = fakeAgent();
+  adapter.attachAgent(agent);
+  const tools = [{ name: "bash", description: "run", parameters: { type: "object", properties: {} } }];
+  await collect(adapter.stream({ provider: "claude", model: "sonnet", sessionId: agent.id, messages: [userMessage("list")], tools }));
+  const claudeSessionId = adapter.sessionFor(agent.id);
+  assert.deepEqual([...adapter.waitingCalls.get(claudeSessionId)], ["park-1"], "precondition: the turn waits on park-1");
+
+  adapter.detachAgent(agent.id);
+
+  assert.equal(rejected.length, 1, "the waiting call is failed rather than left pending");
+  assert.equal(rejected[0].parkId, "park-1", "the failed call is the one the turn was waiting on");
+  assert.ok(rejected[0].error instanceof Error, "the call is failed with an Error");
+});
