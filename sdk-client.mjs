@@ -466,9 +466,10 @@ export class ClaudeSdkClient extends EventEmitter {
       }
       if (!completed) this.completeTurn(session.id, turnId, "completed");
     } finally {
-      // Drop the map entry, then close the query when its message stream ends. The stream ends
-      // after the CLI process has exited, so this close is normally a no-op. It is kept as a
-      // guard. It is not the fix for orphaned children: that is the release in detachAgent.
+      // Close the query when its message stream ends. On a normal turn the CLI process has
+      // already exited by then, so this does nothing. A stream failure can end the loop while
+      // the process is still alive, and this close is a guard for that case. It is not the fix
+      // for orphaned children: that is the release in detachAgent.
       this.queries.delete(turnId);
       try {
         const closing = query.close?.();

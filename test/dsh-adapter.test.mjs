@@ -2165,3 +2165,23 @@ test("detaching an agent rejects the tool calls its parked turn is waiting on", 
   assert.equal(rejected[0].parkId, "park-1", "the failed call is the one the turn was waiting on");
   assert.ok(rejected[0].error instanceof Error, "the call is failed with an Error");
 });
+
+test("a tool call that cannot be failed on detach is logged, and the Claude session is still released", async () => {
+  const runtime = new FakeRuntime();
+  runtime.rejectToolCall = () => { throw new Error("reject refused"); };
+  const warnings = [];
+  const adapter = new ClaudeDshAdapter({ runtime, ready: Promise.resolve(), logger: { warn: message => warnings.push(message) } });
+  const agent = fakeAgent();
+  adapter.attachAgent(agent);
+  const tools = [{ name: "bash", description: "run", parameters: { type: "object", properties: {} } }];
+  await collect(adapter.stream({ provider: "claude", model: "sonnet", sessionId: agent.id, messages: [userMessage("list")], tools }));
+  const claudeSessionId = adapter.sessionFor(agent.id);
+  assert.deepEqual([...adapter.waitingCalls.get(claudeSessionId)], ["park-1"], "precondition: the turn waits on park-1");
+
+  assert.doesNotThrow(() => adapter.detachAgent(agent.id), "a call that cannot be failed must not stop the detach");
+  assert.deepEqual(runtime.released, [claudeSessionId], "the Claude session is released even though a reject failed");
+  assert.ok(
+    warnings.some(message => message.includes(claudeSessionId) && message.includes("reject refused")),
+    "the failed reject is logged with the Claude session id and the error",
+  );
+});
